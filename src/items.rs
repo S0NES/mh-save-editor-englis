@@ -15,6 +15,7 @@ use std::{
 
 const ITEM_NAMES_JSON: &str = include_str!("../assets/mhrise/item_names.json");
 const ITEM_NAMES_CN_JSON: &str = include_str!("../assets/mhrise/item_names_cn.json");
+const ITEM_NAMES_EN_JSON: &str = include_str!("../assets/mhrise/item_names_en.json");
 
 /// Chinese display name and category keyed by numeric item id.
 fn chinese_table() -> &'static HashMap<u32, (&'static str, &'static str)> {
@@ -64,10 +65,33 @@ pub fn item_category(id: u32) -> Option<&'static str> {
   chinese_table().get(&id).map(|(_, category)| *category)
 }
 
-/// Best-effort display name: Chinese name if known, else the internal
-/// identifier, else the raw id in hex.
+/// English display name keyed by numeric item id. Best-effort translation of
+/// the Chinese table (`assets/mhrise/item_names_en.json`).
+fn english_table() -> &'static HashMap<u32, &'static str> {
+  static TABLE: OnceLock<HashMap<u32, &'static str>> = OnceLock::new();
+  TABLE.get_or_init(|| {
+    let parsed: BTreeMap<String, String> =
+      serde_json::from_str(ITEM_NAMES_EN_JSON).expect("embedded english item names");
+    let mut table = HashMap::with_capacity(parsed.len());
+    for (key, name) in parsed {
+      let id: u32 = key.parse().expect("decimal item id");
+      let name: &'static str = Box::leak(name.into_boxed_str());
+      table.insert(id, name);
+    }
+    table
+  })
+}
+
+/// The English display name of an item, if the table has one.
+pub fn item_name_en(id: u32) -> Option<&'static str> {
+  english_table().get(&id).copied()
+}
+
+/// Best-effort display name: English name if known, else the Chinese name,
+/// else the internal identifier, else the raw id in hex.
 pub fn item_display_name(id: u32) -> String {
-  item_name_cn(id)
+  item_name_en(id)
+    .or_else(|| item_name_cn(id))
     .or_else(|| item_name(id))
     .map(str::to_owned)
     .unwrap_or_else(|| format!("0x{id:08X}"))
@@ -96,7 +120,8 @@ mod tests {
 
   #[test]
   fn display_name_prefers_chinese_then_internal_then_hex() {
-    assert_eq!(item_display_name(0x0410_0006), "回复药");
+    assert_eq!(item_display_name(0x0410_0006), "Potion");
+    assert_eq!(item_name_en(0x0410_0006), Some("Potion"));
     assert_eq!(item_display_name(0x0400_0000), "I_Unclassified_None");
     assert_eq!(item_display_name(0xdead_beef), "0xDEADBEEF");
   }

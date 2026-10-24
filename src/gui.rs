@@ -17,7 +17,7 @@ use std::{
 use eframe::egui;
 use egui::Grid;
 
-use crate::{container::SteamSave, edit, format::parse_header};
+use crate::{container::SteamSave, edit, format::parse_header, game::Game, theme::Theme};
 
 const TAB_INFO: usize = 0;
 const TAB_PLAYER: usize = 1;
@@ -33,6 +33,9 @@ const TAB_HELP: usize = 7;
 /// used directly. Returns a status line for the on-screen log.
 fn install_cjk_font(ctx: &egui::Context) -> String {
   for (path, label) in [
+    ("C:/Windows/Fonts/msyh.ttc", "微软雅黑 (msyh.ttc)"),
+    ("C:/Windows/Fonts/msjh.ttc", "微軟正黑體 (msjh.ttc)"),
+    ("C:/Windows/Fonts/simsun.ttc", "宋体 (simsun.ttc)"),
     ("C:/Windows/Fonts/Deng.ttf", "等线 (Deng.ttf)"),
     ("C:/Windows/Fonts/simhei.ttf", "黑体 (simhei.ttf)"),
     ("C:/Windows/Fonts/Dengb.ttf", "等线粗体 (Dengb.ttf)"),
@@ -47,9 +50,9 @@ fn install_cjk_font(ctx: &egui::Context) -> String {
       fonts.families.entry(family).or_default().insert(0, "cjk".to_owned());
     }
     ctx.set_fonts(fonts);
-    return format!("字体: 已加载 {label}");
+    return format!("Font: loaded {label}");
   }
-  "字体: 未找到系统中文字体,中文将显示为方框".to_owned()
+  "Font: no system CJK font found; Chinese text will show as boxes".to_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -75,7 +78,7 @@ impl OpenedSave {
   }
 
   fn summary(&self) -> String {
-    let hunter = if self.hunter_name.is_empty() { "(未知名)" } else { &self.hunter_name };
+    let hunter = if self.hunter_name.is_empty() { "(unknown)" } else { &self.hunter_name };
     format!("{hunter} · Curve {}", self.document.curve_index())
   }
 }
@@ -111,7 +114,12 @@ pub struct GuiApp {
   master_rank_input: String,
   mystery_rank_input: String,
   box_filter: String,
+  /// Index into [`ITEM_CATEGORY_GROUPS`] + 1; 0 = all categories.
+  box_category: usize,
+  box_show_empty: bool,
   box_edits: Vec<String>,
+  game: Game,
+  theme: Theme,
   busy: bool,
   busy_text: String,
   log: String,
@@ -146,16 +154,28 @@ pub struct GuiApp {
 /// (label, item-table categories) groups for the item-box transfer filter.
 /// Ids missing from the name table follow the last ("其它/未知") toggle.
 const ITEM_CATEGORY_GROUPS: &[(&str, &[&str])] = &[
-  ("消耗品", &["Consume"]),
-  ("素材", &["Material", "OffcutsMaterial"]),
-  ("弹药·瓶", &["Bullet", "Bottle"]),
-  ("换金·古董", &["PayOff", "CarryPayOff", "Antique"]),
-  ("其它/工具/未知", &["Tool"]),
+  ("Consumables", &["Consume"]),
+  ("Materials", &["Material", "OffcutsMaterial"]),
+  ("Ammo / Bottles", &["Bullet", "Bottle"]),
+  ("Sell / Antiques", &["PayOff", "CarryPayOff", "Antique"]),
+  ("Tools / Other", &["Tool"]),
 ];
+
+/// Which [`ITEM_CATEGORY_GROUPS`] entry an item id belongs to; ids missing
+/// from the name table fall into the last group.
+fn category_group(id: u32) -> usize {
+  let last = ITEM_CATEGORY_GROUPS.len() - 1;
+  crate::items::item_category(id)
+    .and_then(|category| {
+      ITEM_CATEGORY_GROUPS.iter().position(|(_, categories)| categories.contains(&category))
+    })
+    .unwrap_or(last)
+}
 
 impl GuiApp {
   pub fn new(creation_context: &eframe::CreationContext) -> Self {
     let font_status = install_cjk_font(&creation_context.egui_ctx);
+    creation_context.egui_ctx.set_visuals(Theme::default().visuals());
     let mut app = Self {
       xfer_cats: vec![true; ITEM_CATEGORY_GROUPS.len()],
       xfer_equip_box: true,
@@ -170,10 +190,10 @@ impl GuiApp {
       app.steamid64 = steamid64_from_account(*account).to_string();
     }
     if app.discovered.is_empty() {
-      app.log_line("自动查找: 未在本机找到 MHR 存档目录,请手动选择存档文件 (见“帮助”页)");
+      app.log_line("Auto-detect: no MH Rise save folder found on this PC. Browse for a save file (see the Help tab).");
     } else {
       app.log_line(&format!(
-        "自动查找: 找到 {} 个角色存档,可在“快速选择”中选取",
+        "Auto-detect: found {} character saves; pick one in Quick select",
         app.discovered.len()
       ));
     }
@@ -210,7 +230,7 @@ impl GuiApp {
   }
 
   fn parsed_steamid64(&self) -> Result<u64, &'static str> {
-    self.steamid64.trim().parse::<u64>().map_err(|_| "SteamID64 必须是纯数字")
+    self.steamid64.trim().parse::<u64>().map_err(|_| "SteamID64 must be digits only")
   }
 
   fn spawn(&mut self, context: &egui::Context, task: WorkerTask) {
@@ -231,12 +251,12 @@ impl GuiApp {
   /// differ from the opened document. Runs on the UI thread: pure tree walks.
   fn apply_player_edits(&mut self) -> Result<(), String> {
     let Some(opened) = self.target.as_mut() else {
-      return Err("尚未打开目标存档".to_owned());
+      return Err("No target save is open".to_owned());
     };
     let (current_money, current_total) = edit::read_money(opened.document.payload())
-      .ok_or_else(|| "未找到金钱字段 (schema 不符)".to_owned())?;
+      .ok_or_else(|| "Money field not found (schema mismatch)".to_owned())?;
     let current_points = edit::read_points(opened.document.payload())
-      .ok_or_else(|| "未找到点数字段 (schema 不符)".to_owned())?;
+      .ok_or_else(|| "Points field not found (schema mismatch)".to_owned())?;
 
     let mut applied = 0usize;
     if let Ok(value) = self.money_input.trim().parse::<u32>()
@@ -286,26 +306,26 @@ impl GuiApp {
       if trimmed.is_empty() {
         return Ok(None);
       }
-      let value = trimmed.parse::<u32>().map_err(|_| format!("等级必须是数字: {text:?}"))?;
+      let value = trimmed.parse::<u32>().map_err(|_| format!("Rank must be a number: {text:?}"))?;
       Ok(Some(value))
     };
     let hunter_rank = rank_parse(&self.hunter_rank_input)?;
     let master_rank = rank_parse(&self.master_rank_input)?;
     let mystery_rank = rank_parse(&self.mystery_rank_input)?;
     for (name, value, cap) in [
-      ("猎人等级", hunter_rank, 999),
-      ("大师等级", master_rank, 999),
-      ("怪异研究等级", mystery_rank, 300),
+      ("Hunter Rank", hunter_rank, 999),
+      ("Master Rank", master_rank, 999),
+      ("Anomaly Research Rank", mystery_rank, 300),
     ] {
       if let Some(value) = value
         && (value == 0 || value > cap)
       {
-        return Err(format!("{name} 超出范围 (1-{cap}): {value}"));
+        return Err(format!("{name} out of range (1-{cap}): {value}"));
       }
     }
     if hunter_rank.is_some() || master_rank.is_some() || mystery_rank.is_some() {
       let current = edit::read_ranks(opened.document.payload())
-        .ok_or_else(|| "未找到等级字段 (schema 不符)".to_owned())?;
+        .ok_or_else(|| "Rank field not found (schema mismatch)".to_owned())?;
       let changed = |input: Option<u32>, current_value: u32| input.is_some_and(|v| v != current_value);
       if changed(hunter_rank, current.hunter)
         || changed(master_rank, current.master)
@@ -321,13 +341,13 @@ impl GuiApp {
     }
 
     if applied == 0 {
-      return Err("没有可应用的修改 (数值未变化或输入为空)".to_owned());
+      return Err("Nothing to apply (values unchanged or empty)".to_owned());
     }
     // Refresh the input boxes from the document so they show the new values.
     let (money, total) = edit::read_money(opened.document.payload())
-      .ok_or_else(|| "未找到金钱字段 (schema 不符)".to_owned())?;
+      .ok_or_else(|| "Money field not found (schema mismatch)".to_owned())?;
     let points = edit::read_points(opened.document.payload())
-      .ok_or_else(|| "未找到点数字段 (schema 不符)".to_owned())?;
+      .ok_or_else(|| "Points field not found (schema mismatch)".to_owned())?;
     self.money_input = money.to_string();
     self.total_input = total.to_string();
     self.points_input = points.to_string();
@@ -365,10 +385,10 @@ impl GuiApp {
   fn apply_box_edits(&mut self) -> Result<String, String> {
     let changes = self.pending_item_changes();
     if changes.is_empty() {
-      return Err("没有可应用的修改 (数量未变化或输入为空)".to_owned());
+      return Err("Nothing to apply (quantities unchanged or empty)".to_owned());
     }
     let Some(opened) = self.target.as_mut() else {
-      return Err("尚未打开目标存档".to_owned());
+      return Err("No target save is open".to_owned());
     };
     let report = edit::set_item_counts(opened.document.payload_mut(), &changes)
       .map_err(|error| error.to_string())?;
@@ -379,14 +399,14 @@ impl GuiApp {
       .collect();
     self.box_edits = vec![String::new(); opened.box_items.len()];
     self.dirty = true;
-    Ok(format!("{} 处更新,{} 个新物品填入空槽", report.applied, report.filled))
+    Ok(format!("{} updated, {} new items placed in empty slots", report.applied, report.filled))
   }
 
   /// Merge-transfer only the source item slots whose category group is
   /// enabled; other slots keep the target's contents.
   fn transfer_items_filtered(&mut self) -> Result<String, String> {
     let Some(source) = self.source.as_ref() else {
-      return Err("尚未打开来源存档".to_owned());
+      return Err("No source save is open".to_owned());
     };
     let groups: Vec<&[&str]> = ITEM_CATEGORY_GROUPS
       .iter()
@@ -401,13 +421,13 @@ impl GuiApp {
       None => other_allowed,
     };
     let Some(target) = self.target.as_mut() else {
-      return Err("尚未打开目标存档".to_owned());
+      return Err("No target save is open".to_owned());
     };
     let report = edit::transfer_item_box_filtered(target.document.payload_mut(), source.document.payload(), keep)
       .map_err(|error| error.to_string())?;
     self.refresh_target_items();
     Ok(format!(
-      "道具箱合并完成: {} 槽中取自来源 {} 件,保留目标 {} 件 (来源共 {} 件道具)",
+      "Item Box merged: of {} slots, {} items from source, {} kept from target (source has {} items)",
       report.slots, report.transferred, report.kept, report.source_items
     ))
   }
@@ -415,10 +435,10 @@ impl GuiApp {
   /// Transfer only the ticked equipment components.
   fn transfer_equipment_selected(&mut self) -> Result<String, String> {
     let Some(source) = self.source.as_ref() else {
-      return Err("尚未打开来源存档".to_owned());
+      return Err("No source save is open".to_owned());
     };
     let Some(target) = self.target.as_mut() else {
-      return Err("尚未打开目标存档".to_owned());
+      return Err("No target save is open".to_owned());
     };
     let parts = edit::EquipParts {
       equip_box: self.xfer_equip_box,
@@ -431,16 +451,16 @@ impl GuiApp {
     self.refresh_target_items();
     let partial = parts != edit::EquipParts::all();
     Ok(format!(
-      "装备转移完成: {};装备箱 {} 槽 {} 件{}",
+      "Equipment transferred: {}; Equipment Box {} slots, {} items{}",
       report
         .classes
         .iter()
-        .map(|(label, fields)| format!("{label}={fields}字段"))
+        .map(|(label, fields)| format!("{label}={fields} fields"))
         .collect::<Vec<_>>()
         .join(", "),
       report.box_slots,
       report.box_used,
-      if partial { " (部分转移:进游戏后请先检查穿着与装备组合)" } else { "" }
+      if partial { " (partial transfer: check worn gear and loadouts in game)" } else { "" }
     ))
   }
 
@@ -470,7 +490,7 @@ impl GuiApp {
     };
     let output = derived_output(&opened.path, "edited");
     if output == opened.path {
-      self.log_line("✘ 输出路径与源文件相同;源存档永远不会被修改");
+      self.log_line("✘ Output path equals the source file; the source save is never modified");
       return;
     }
     let snapshot = Box::new(OpenedSave {
@@ -520,18 +540,18 @@ impl WorkerTask {
     match self {
       WorkerTask::Open { path, is_source, .. } => {
         if *is_source {
-          format!("打开来源存档: {}", path.display())
+          format!("Open source save: {}", path.display())
         } else {
-          format!("打开存档: {}", path.display())
+          format!("Open save: {}", path.display())
         }
       }
-      WorkerTask::Save { output, .. } => format!("保存到: {}", output.display()),
+      WorkerTask::Save { output, .. } => format!("Save to: {}", output.display()),
       WorkerTask::SaveInPlace { backup_dir, .. } => {
-        format!("写入原存档 (先备份 {})", backup_dir.display())
+        format!("Write to original save (backup first: {})", backup_dir.display())
       }
-      WorkerTask::Backup { dir } => format!("备份目录: {}", dir.display()),
+      WorkerTask::Backup { dir } => format!("Back up folder: {}", dir.display()),
       WorkerTask::Restore { backup, target_dir } => {
-        format!("还原 {} 到 {}", backup.display(), target_dir.display())
+        format!("Restore {} to {}", backup.display(), target_dir.display())
       }
     }
   }
@@ -563,7 +583,7 @@ impl WorkerTask {
         let result = crate::archive::backup_dir(&dir, None)
           .map(|report| {
             format!(
-              "已备份 {} 个文件 ({} 字节) 到 {},每份拷贝已逐字节校验",
+              "Backed up {} files ({} bytes) to {}; every copy verified byte by byte",
               report.files.len(),
               report.total_bytes(),
               report.destination.display()
@@ -576,7 +596,7 @@ impl WorkerTask {
         let result = crate::archive::restore_dir(&backup, &target_dir, true)
           .map(|report| {
             format!(
-              "已还原 {} 个文件 ({} 字节) 到 {},请重新打开存档查看",
+              "Restored {} files ({} bytes) to {}; reopen the save to see it",
               report.files.len(),
               report.total_bytes(),
               target_dir.display()
@@ -643,7 +663,7 @@ impl eframe::App for GuiApp {
             {
               self.steamid64 = steamid64_from_account(account).to_string();
               self.log_line(&format!(
-                "⚠ 已根据存档路径把 SteamID64 自动修正为 {},请重试",
+                "! SteamID64 corrected to {} from the save path; try again",
                 self.steamid64
               ));
             }
@@ -665,8 +685,8 @@ impl eframe::App for GuiApp {
               self.box_edits = vec![String::new(); opened.box_items.len()];
               self.refresh_progress_inputs();
               self.log_line(&format!(
-                "✔ 已打开{}: {} ({})",
-                if is_source { "来源存档" } else { "目标存档" },
+                "✔ Opened {}: {} ({})",
+                if is_source { "source save" } else { "target save" },
                 opened.path.display(),
                 opened.summary()
               ));
@@ -678,7 +698,7 @@ impl eframe::App for GuiApp {
                 self.reopen_clicked_once = false;
               }
             }
-            Err(error) => self.log_line(&format!("✘ 打开失败: {error}")),
+            Err(error) => self.log_line(&format!("✘ Open failed: {error}")),
           }
         }
         Ok(WorkerEvent::Saved(result)) => {
@@ -688,14 +708,14 @@ impl eframe::App for GuiApp {
             Ok((output, backup)) => {
               self.dirty = false;
               self.log_line(&format!(
-                "✔ 已写入: {}{}",
+                "✔ Written: {}{}",
                 output.display(),
                 backup
-                  .map(|backup| format!(" (已自动备份到 {})", backup.display()))
+                  .map(|backup| format!(" (backed up to {})", backup.display()))
                   .unwrap_or_default()
               ));
             }
-            Err(error) => self.log_line(&format!("✘ 保存失败: {error}")),
+            Err(error) => self.log_line(&format!("✘ Save failed: {error}")),
           }
         }
         Ok(WorkerEvent::Report(result)) => {
@@ -721,7 +741,7 @@ impl eframe::App for GuiApp {
         Err(TryRecvError::Disconnected) => {
           self.busy = false;
           self.receiver = None;
-          self.log_line("✘ 后台线程异常退出");
+          self.log_line("✘ Worker thread exited unexpectedly");
         }
       }
     }
@@ -752,9 +772,9 @@ impl eframe::App for GuiApp {
       ui.add_space(6.0);
       ui.separator();
       self.show_save_bar(ui);
-      ui.label("运行日志");
+      ui.label("Activity log");
       egui::ScrollArea::vertical().stick_to_bottom(true).max_height(120.0).show(ui, |ui| {
-        ui.monospace(if self.log.is_empty() { "(就绪)" } else { &self.log });
+        ui.monospace(if self.log.is_empty() { "(ready)" } else { &self.log });
       });
     });
 
@@ -785,16 +805,39 @@ impl eframe::App for GuiApp {
 
 impl GuiApp {
   fn show_top_bar(&mut self, ui: &mut egui::Ui) {
-    ui.heading("MHRise 存档编辑器 (Steam)");
+    ui.horizontal(|ui| {
+      ui.heading("MH Save Editor");
+      ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if ui.button(format!("Theme: {}", self.theme.label())).clicked() {
+          self.theme = self.theme.toggled();
+          ui.ctx().set_visuals(self.theme.visuals());
+        }
+      });
+    });
+    ui.horizontal(|ui| {
+      ui.label("Game");
+      for game in Game::ALL {
+        let text = format!("{} · {}", game.name(), game.status());
+        if ui.selectable_label(self.game == game, text).clicked() {
+          self.game = game;
+        }
+      }
+    });
+    if !self.game.supported() {
+      ui.colored_label(
+        self.theme.palette().danger,
+        format!("✘ {} saves are not supported yet. Only Monster Hunter Rise can be edited.", self.game.name()),
+      );
+    }
     ui.add_space(4.0);
     Grid::new("top-bar").num_columns(4).spacing([8.0, 6.0]).show(ui, |ui| {
-      ui.label("快速选择");
+      ui.label("Quick select");
       let selected = self
         .discovered
         .iter()
         .find(|(path, _, _)| path.display().to_string() == self.target_path)
         .map(|(_, label, _)| label.clone())
-        .unwrap_or_else(|| "(未发现存档)".to_owned());
+        .unwrap_or_else(|| "(no saves found)".to_owned());
       egui::ComboBox::from_id_salt("discovered-saves").selected_text(selected).show_ui(ui, |ui| {
         for (path, label, account) in &self.discovered {
           if ui.selectable_value(&mut self.target_path, path.display().to_string(), label).clicked()
@@ -804,7 +847,7 @@ impl GuiApp {
             // SteamID64 automatically so users never have to look it up.
             self.steamid64 = steamid64_from_account(*account).to_string();
             let note = format!(
-              "已根据存档路径自动填入 SteamID64: {}
+              "SteamID64 filled in from the save path: {}
 ",
               self.steamid64
             );
@@ -816,32 +859,35 @@ impl GuiApp {
       ui.add_sized([200.0, 20.0], egui::TextEdit::singleline(&mut self.steamid64));
       ui.end_row();
 
-      ui.label("目标存档");
+      ui.label("Target save");
       ui.add_sized([420.0, 20.0], egui::TextEdit::singleline(&mut self.target_path));
-      if ui.add_enabled(!self.busy, egui::Button::new("浏览…")).clicked()
+      if ui.add_enabled(!self.busy, egui::Button::new("Browse…")).clicked()
         && let Some(path) = rfd::FileDialog::new()
-          .add_filter("MHRise 存档", &["bin"])
-          .set_title("选择目标存档")
+          .add_filter("MH Rise save", &["bin"])
+          .set_title("Choose target save")
           .pick_file()
       {
         self.target_path = path.display().to_string();
       }
       let steamid = self.parsed_steamid64();
       let open_label = if self.dirty && !self.reopen_clicked_once {
-        "打开存档 (有未保存修改)"
+        "Open save (unsaved changes)"
       } else {
-        "打开存档"
+        "Open save"
       };
       if ui
         .add_enabled(
-          !self.busy && steamid.is_ok() && !self.target_path.trim().is_empty(),
+          !self.busy
+            && self.game.supported()
+            && steamid.is_ok()
+            && !self.target_path.trim().is_empty(),
           egui::Button::new(open_label),
         )
         .clicked()
       {
         if self.dirty && !self.reopen_clicked_once {
           self.reopen_clicked_once = true;
-          self.log_line("⚠ 存在未保存的修改;再次点击“打开存档”将放弃这些修改并重新打开");
+          self.log_line("! Unsaved changes: click Open save again to discard them and reopen");
         } else {
           let task = WorkerTask::Open {
             path: PathBuf::from(self.target_path.trim()),
@@ -855,31 +901,31 @@ impl GuiApp {
       ui.end_row();
     });
     if let Some(error) = &self.status_error {
-      ui.colored_label(egui::Color32::LIGHT_RED, format!("✘ 上次操作失败: {error}"));
+      ui.colored_label(self.theme.palette().danger, format!("✘ Last operation failed: {error}"));
     }
     ui.label(match (&self.target, self.busy) {
       (_, true) => format!("⏳ {}…", self.busy_text),
       (Some(opened), _) => format!(
-        "已打开: {} ({}){}",
+        "Opened: {} ({}){}",
         opened.path.display(),
         opened.summary(),
-        if self.dirty { " · ● 有未保存修改" } else { "" }
+        if self.dirty { " · ● unsaved changes" } else { "" }
       ),
-      (None, _) => "尚未打开存档".to_owned(),
+      (None, _) => "No save open".to_owned(),
     });
   }
 
   fn show_tab_bar(&mut self, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
       for (tab, label) in [
-        (TAB_INFO, "一般信息"),
-        (TAB_PLAYER, "玩家数据"),
-        (TAB_ITEMBOX, "道具箱编辑"),
-        (TAB_EQUIP, "装备组合"),
-        (TAB_TRANSFER, "存档转移"),
-        (TAB_PROGRESS, "进度与解禁"),
-        (TAB_BACKUP, "备份还原"),
-        (TAB_HELP, "帮助"),
+        (TAB_INFO, "General"),
+        (TAB_PLAYER, "Player"),
+        (TAB_ITEMBOX, "Item Box"),
+        (TAB_EQUIP, "Loadouts"),
+        (TAB_TRANSFER, "Transfer"),
+        (TAB_PROGRESS, "Progress"),
+        (TAB_BACKUP, "Backup"),
+        (TAB_HELP, "Help"),
       ] {
         ui.selectable_value(&mut self.tab, tab, label);
       }
@@ -889,13 +935,13 @@ impl GuiApp {
 
   fn show_info_tab(&mut self, ui: &mut egui::Ui) {
     let Some(opened) = self.target.as_ref() else {
-      ui.label("尚未打开存档:先用顶部“快速选择”或“浏览…”选定存档,再点“打开存档”。");
+      ui.label("No save open. Choose one with Quick select or Browse above, then click Open save.");
       return;
     };
     Grid::new("info").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-      ui.label("猎人名称");
+      ui.label("Hunter name");
       ui.label(if opened.hunter_name.is_empty() {
-        "(未找到)".to_owned()
+        "(not found)".to_owned()
       } else {
         opened.hunter_name.clone()
       });
@@ -903,29 +949,29 @@ impl GuiApp {
       ui.label("Curve Index");
       ui.label(opened.document.curve_index().to_string());
       ui.end_row();
-      ui.label("解密后大小");
-      ui.label(format!("{} 字节", opened.document.original_decrypted().len()));
+      ui.label("Decrypted size");
+      ui.label(format!("{} bytes", opened.document.original_decrypted().len()));
       ui.end_row();
-      ui.label("道具箱");
+      ui.label("Item Box");
       ui.label(format!(
-        "{} 槽,{} 件非空",
+        "{} slots, {} non-empty",
         opened.box_items.len(),
         opened.box_items.iter().filter(|(_, num)| *num > 0).count()
       ));
       ui.end_row();
-      ui.label("金钱 / 点数");
+      ui.label("Zenny / Points");
       let (money, total) = edit::read_money(opened.document.payload()).unwrap_or((0, 0));
       let points = edit::read_points(opened.document.payload()).unwrap_or(0);
-      ui.label(format!("{money} / {points} (累计获得 {total})"));
+      ui.label(format!("{money} / {points} ({total} earned in total)"));
       ui.end_row();
-      ui.label("等级 (HR/MR/怪异研究)");
+      ui.label("Rank (HR / MR / Anomaly)");
       let ranks = edit::read_ranks(opened.document.payload());
       ui.label(match ranks {
         Some(ranks) => format!("{} / {} / {}", ranks.hunter, ranks.master, ranks.mystery_research),
-        None => "(未找到)".to_owned(),
+        None => "(not found)".to_owned(),
       });
       ui.end_row();
-      ui.label("文件");
+      ui.label("File");
       ui.label(opened.path.display().to_string());
       ui.end_row();
     });
@@ -933,7 +979,7 @@ impl GuiApp {
       && let Ok(header) = parse_header(&data)
     {
       ui.label(format!(
-        "容器: DSSS v{}, flags=0x{:08x}, 文件 {} 字节",
+        "Container: DSSS v{}, flags=0x{:08x}, file {} bytes",
         header.version,
         header.raw_flags,
         data.len()
@@ -943,30 +989,30 @@ impl GuiApp {
 
   fn show_player_tab(&mut self, ui: &mut egui::Ui) {
     if self.target.is_none() {
-      ui.label("尚未打开存档。");
+      ui.label("No save open.");
       return;
     }
     Grid::new("player").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-      ui.label("猎人名称");
+      ui.label("Hunter name");
       let name = self.target.as_ref().map(|opened| opened.hunter_name.clone()).unwrap_or_default();
-      ui.label(if name.is_empty() { "(未找到)".to_owned() } else { name });
+      ui.label(if name.is_empty() { "(not found)".to_owned() } else { name });
       ui.end_row();
-      ui.label("金钱");
+      ui.label("Zenny");
       ui.add_sized([200.0, 20.0], egui::TextEdit::singleline(&mut self.money_input));
       ui.end_row();
-      ui.label("累计金钱");
+      ui.label("Total Zenny earned");
       ui.add_sized([200.0, 20.0], egui::TextEdit::singleline(&mut self.total_input));
       ui.end_row();
-      ui.label("点数");
+      ui.label("Points");
       ui.add_sized([200.0, 20.0], egui::TextEdit::singleline(&mut self.points_input));
       ui.end_row();
-      ui.label("猎人等级 (HR)");
+      ui.label("Hunter Rank (HR)");
       ui.add_sized([200.0, 20.0], egui::TextEdit::singleline(&mut self.hunter_rank_input));
       ui.end_row();
-      ui.label("大师等级 (MR)");
+      ui.label("Master Rank (MR)");
       ui.add_sized([200.0, 20.0], egui::TextEdit::singleline(&mut self.master_rank_input));
       ui.end_row();
-      ui.label("怪异研究等级");
+      ui.label("Anomaly Research Rank");
       ui.add_sized([200.0, 20.0], egui::TextEdit::singleline(&mut self.mystery_rank_input));
       ui.end_row();
     });
@@ -974,59 +1020,83 @@ impl GuiApp {
     ui.horizontal(|ui| {
       let steamid = self.parsed_steamid64();
       let ready = !self.busy && steamid.is_ok() && self.target.is_some();
-      if ui.add_enabled(ready, egui::Button::new("应用数值修改")).clicked() {
+      if ui.add_enabled(ready, egui::Button::new("Apply changes")).clicked() {
         match self.apply_player_edits() {
-          Ok(()) => self.log_line("✔ 数值修改已应用 (内存中)"),
+          Ok(()) => self.log_line("✔ Changes applied (in memory)"),
           Err(error) => self.log_line(&format!("✘ {error}")),
         }
       }
       if ui
-        .add_enabled(!self.busy && self.target.is_some(), egui::Button::new("写入原存档 (先自动备份)"))
+        .add_enabled(!self.busy && self.target.is_some(), egui::Button::new("Write to save (backs up first)"))
         .clicked()
       {
         self.save_target_in_place(ui);
       }
-      ui.label("(留空 = 不修改该值;名称当前为只读)");
+      ui.label("(leave blank = no change; the name is read-only)");
     });
     ui.colored_label(
-      egui::Color32::LIGHT_YELLOW,
-      "⚠ 等级受解禁机制约束:未完成对应解禁任务(集会所/大师等级/怪异调查的紧急任务链)的存档,读档时会提示获得成就,但游戏仍会把等级钳制在当前解禁上限内。解禁状态存于任务清通标志位图中,自动改写暂不支持;请先在游戏内完成解禁任务,或改用“存档转移”整体搬运高等级存档。",
+      self.theme.palette().accent,
+      "! Ranks are limited by the unlock system: if the matching unlock quests (Hub / Master Rank / Anomaly Investigation urgent chains) are not complete, the game shows an achievement popup on load but still clamps the rank to the current cap. Unlock state is stored in a quest-clear bitmap that this tool cannot rewrite yet; finish the unlock quests in game, or use Transfer to move over a high-rank save.",
     );
   }
 
   fn show_itembox_tab(&mut self, ui: &mut egui::Ui) {
     if self.target.is_none() {
-      ui.label("尚未打开存档。");
+      ui.label("No save open.");
       return;
     }
     ui.horizontal(|ui| {
-      ui.label("筛选 (名称 / 十六进制 / 十进制 ID)");
-      ui.add_sized([200.0, 20.0], egui::TextEdit::singleline(&mut self.box_filter));
+      ui.add_sized(
+        [200.0, 20.0],
+        egui::TextEdit::singleline(&mut self.box_filter).hint_text("Search name / ID"),
+      );
+      let current = if self.box_category == 0 {
+        "All categories"
+      } else {
+        ITEM_CATEGORY_GROUPS[self.box_category - 1].0
+      };
+      egui::ComboBox::from_id_salt("box-category").selected_text(current).show_ui(ui, |ui| {
+        ui.selectable_value(&mut self.box_category, 0, "All categories");
+        for (i, (label, _)) in ITEM_CATEGORY_GROUPS.iter().enumerate() {
+          ui.selectable_value(&mut self.box_category, i + 1, *label);
+        }
+      });
+      ui.checkbox(&mut self.box_show_empty, "Show empty slots");
       let changes = self.pending_item_changes();
-      let apply_text = format!("应用道具修改 ({})", changes.len());
+      let apply_text = format!("Apply item changes ({})", changes.len());
       if ui.add_enabled(!self.busy && !changes.is_empty(), egui::Button::new(apply_text)).clicked()
       {
         match self.apply_box_edits() {
-          Ok(text) => self.log_line(&format!("✔ 道具修改已应用: {text} (内存中)")),
+          Ok(text) => self.log_line(&format!("✔ Item changes applied: {text} (in memory)")),
           Err(error) => self.log_line(&format!("✘ {error}")),
         }
       }
       if ui
-        .add_enabled(!self.busy && self.target.is_some(), egui::Button::new("写入原存档 (先自动备份)"))
+        .add_enabled(!self.busy && self.target.is_some(), egui::Button::new("Write to save (backs up first)"))
         .clicked()
       {
         self.save_target_in_place(ui);
       }
       if self.dirty {
-        ui.label(egui::RichText::new("● 有未保存修改").color(egui::Color32::LIGHT_YELLOW));
+        ui.label(egui::RichText::new("● Unsaved changes").color(self.theme.palette().accent));
       }
     });
     if self.box_edits.len() != self.box_items_len() {
-      ui.label("(加载中…)");
+      ui.label("(loading…)");
       return;
     }
     let filter = self.box_filter.trim().to_lowercase();
     let rows = self.visible_box_rows(&filter);
+    let muted = self.theme.palette().ink_muted;
+    ui.horizontal(|ui| {
+      for (width, text) in [(52.0, "Slot"), (240.0, "Name"), (90.0, "Category"), (84.0, "ID"), (72.0, "Qty")] {
+        ui.add_sized(
+          [width, 16.0],
+          egui::Label::new(egui::RichText::new(text).small().strong().color(muted)),
+        );
+      }
+      ui.label(egui::RichText::new("New qty").small().strong().color(muted));
+    });
     egui::ScrollArea::vertical().max_height(320.0).auto_shrink(false).show_rows(
       ui,
       20.0,
@@ -1039,7 +1109,7 @@ impl GuiApp {
       },
     );
     ui.label(format!(
-      "显示 {} / {} 项;“新数量”留空 = 不修改;填 0 = 清空该物品",
+      "Showing {} of {} slots; leave New qty blank = no change; enter 0 = clear the item",
       rows.len(),
       self.box_items_len()
     ));
@@ -1049,24 +1119,47 @@ impl GuiApp {
     let Some((id, num)) = self.target.as_ref().map(|opened| opened.box_items[index]) else {
       return;
     };
+    let muted = self.theme.palette().ink_muted;
     ui.horizontal(|ui| {
-      ui.monospace(format!("{id:08x}"));
-      let name = crate::items::item_display_name(id);
-      ui.add_sized([220.0, 18.0], egui::Label::new(name).truncate());
-      if let Some(category) = crate::items::item_category(id) {
-        ui.add_sized([80.0, 18.0], egui::Label::new(egui::RichText::new(category).weak()).truncate());
-      }
-      ui.add_sized([80.0, 18.0], egui::Label::new(format!("当前 {num}")));
+      ui.add_sized(
+        [52.0, 18.0],
+        egui::Label::new(egui::RichText::new(format!("{:04}", index + 1)).monospace().color(muted)),
+      );
       if num == 0 {
-        ui.label("(空)");
+        ui.add_sized(
+          [240.0, 18.0],
+          egui::Label::new(egui::RichText::new("(empty slot)").italics().color(muted)),
+        );
+      } else {
+        let name = crate::items::item_display_name(id);
+        let response = ui
+          .allocate_ui_with_layout(
+            egui::vec2(240.0, 18.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| ui.add(egui::Label::new(egui::RichText::new(name).strong()).truncate()),
+          )
+          .inner;
+        if let Some(cn) = crate::items::item_name_cn(id) {
+          response.on_hover_text(cn);
+        }
       }
+      let category = crate::items::item_category(id).unwrap_or("-");
+      ui.add_sized([90.0, 18.0], egui::Label::new(egui::RichText::new(category).color(muted)).truncate());
+      ui.add_sized(
+        [84.0, 18.0],
+        egui::Label::new(egui::RichText::new(format!("{id:08x}")).monospace().color(muted)),
+      );
+      ui.add_sized(
+        [72.0, 18.0],
+        egui::Label::new(egui::RichText::new(num.to_string()).monospace()),
+      );
       ui.add_sized([90.0, 18.0], egui::TextEdit::singleline(&mut self.box_edits[index]));
     });
   }
 
   fn show_equip_tab(&mut self, ui: &mut egui::Ui) {
     if self.target.is_none() {
-      ui.label("先用顶部“快速选择”或“浏览…”打开目标存档。");
+      ui.label("Open the target save first (Quick select or Browse above).");
       return;
     }
     ui.columns(2, |columns| {
@@ -1074,14 +1167,14 @@ impl GuiApp {
       let left = column_iter.next().expect("two columns");
       let right = column_iter.next().expect("two columns");
       // Left: the target's own loadout registers.
-      left.heading("目标装备组合 (224 槽)");
+      left.heading("Target loadouts (224 slots)");
       let loadouts = self
         .target
         .as_ref()
         .map(|opened| edit::read_equip_loadouts(opened.document.payload()))
         .unwrap_or_default();
       let used = loadouts.iter().filter(|loadout| loadout.is_using).count();
-      left.label(format!("已登记 {used} 个;组合引用的装备箱槽位在转移时可一并搬运"));
+      left.label(format!("{used} registered; the Equipment Box slots a loadout references can be moved with it"));
       egui::ScrollArea::vertical().max_height(360.0).auto_shrink(false).show(left, |ui| {
         for loadout in &loadouts {
           ui.horizontal(|ui| {
@@ -1089,30 +1182,30 @@ impl GuiApp {
             if loadout.is_using {
               ui.label(&loadout.name);
             } else {
-              ui.label(egui::RichText::new("(空位)").weak());
+              ui.label(egui::RichText::new("(empty)").weak());
             }
           });
         }
       });
 
       // Right: transfer controls.
-      right.heading("从来源存档转移");
+      right.heading("Transfer from source save");
       let Some(source) = self.source.as_ref() else {
-        right.label("先在“存档转移”页打开来源存档,才能转移组合/单件装备。");
+        right.label("Open a source save on the Transfer tab first to transfer loadouts or single pieces.");
         return;
       };
       let source_loadouts = edit::read_equip_loadouts(source.document.payload());
       let using: Vec<&edit::EquipLoadout> =
         source_loadouts.iter().filter(|loadout| loadout.is_using).collect();
       if using.is_empty() {
-        right.label("来源存档没有已登记的装备组合。");
+        right.label("The source save has no registered loadouts.");
         return;
       }
       let selected = self
         .equip_source_combo
         .min(using.len().saturating_sub(1));
       let selected_text = format!("[{}] {}", using[selected].index, using[selected].name);
-      right.label("来源组合:");
+      right.label("Source loadout:");
       egui::ComboBox::from_id_salt("equip-source-loadout")
         .selected_text(selected_text)
         .width(260.0)
@@ -1126,45 +1219,45 @@ impl GuiApp {
           }
         });
       right.horizontal(|ui| {
-        ui.label("引用装备:");
-        ui.checkbox(&mut self.equip_with_pieces, "同时搬运组合引用的装备(同槽位覆盖)");
+        ui.label("Referenced gear:");
+        ui.checkbox(&mut self.equip_with_pieces, "Also move the gear the loadout references (overwrites the same slots)");
       });
       right.horizontal(|ui| {
-        ui.label("目标槽位(留空 = 第一个空位):");
+        ui.label("Target slot (blank = first empty slot):");
         ui.add_sized([80.0, 20.0], egui::TextEdit::singleline(&mut self.equip_target_slot_text));
       });
       let source_index = using[selected].index;
       if right
-        .add_enabled(!self.busy, egui::Button::new("转移装备组合"))
+        .add_enabled(!self.busy, egui::Button::new("Transfer loadout"))
         .clicked()
       {
         match self.apply_equip_loadout_transfer(source_index) {
-          Ok(text) => self.log_line(&format!("✔ {text} (内存中)")),
+          Ok(text) => self.log_line(&format!("✔ {text} (in memory)")),
           Err(error) => self.log_line(&format!("✘ {error}")),
         }
       }
 
       right.add_space(10.0);
       right.separator();
-      right.heading("单件装备转移");
+      right.heading("Single piece transfer");
       right.horizontal(|ui| {
-        ui.label("来源槽位:");
+        ui.label("Source slot:");
         ui.add_sized([70.0, 20.0], egui::TextEdit::singleline(&mut self.equip_piece_source_text));
-        ui.label("目标槽位:");
+        ui.label("Target slot:");
         ui.add_sized([70.0, 20.0], egui::TextEdit::singleline(&mut self.equip_piece_target_text));
       });
       if right
-        .add_enabled(!self.busy, egui::Button::new("转移单件装备 (目标槽覆盖)"))
+        .add_enabled(!self.busy, egui::Button::new("Transfer piece (overwrites target slot)"))
         .clicked()
       {
         match self.apply_equip_piece_transfer() {
-          Ok(text) => self.log_line(&format!("✔ {text} (内存中)")),
+          Ok(text) => self.log_line(&format!("✔ {text} (in memory)")),
           Err(error) => self.log_line(&format!("✘ {error}")),
         }
       }
-      right.label("装备以装备箱槽位号定位;覆盖目标槽位前请确认其内容不再需要。");
+      right.label("Gear is addressed by Equipment Box slot number; make sure the target slot contents are no longer needed.");
     });
-    ui.label("所有转移在内存中立即生效;确认无误后用底部按钮写盘(写入原存档会先自动备份)。");
+    ui.label("Every transfer applies in memory at once. When it looks right, write to disk with the buttons below (writing to the original save backs up first).");
   }
 
   /// Applies the selected source loadout to the chosen target slot.
@@ -1173,14 +1266,14 @@ impl GuiApp {
     let target_index = if target_slot_text.is_empty() {
       None
     } else {
-      Some(target_slot_text.parse::<usize>().map_err(|_| "目标槽位必须是数字")?)
+      Some(target_slot_text.parse::<usize>().map_err(|_| "Target slot must be a number")?)
     };
     {
       let Some(source) = self.source.as_ref() else {
-        return Err("尚未打开来源存档".to_owned());
+        return Err("No source save is open".to_owned());
       };
       let Some(target) = self.target.as_mut() else {
-        return Err("尚未打开目标存档".to_owned());
+        return Err("No target save is open".to_owned());
       };
       let slot = edit::copy_equip_loadout(
         target.document.payload_mut(),
@@ -1191,8 +1284,8 @@ impl GuiApp {
       )
       .map_err(|error| error.to_string())?;
       self.dirty = true;
-      let pieces = if self.equip_with_pieces { ",引用装备已同槽位搬运" } else { "" };
-      Ok(format!("装备组合已转移到槽位 {slot}{pieces}"))
+      let pieces = if self.equip_with_pieces { ", referenced gear moved to the same slots" } else { "" };
+      Ok(format!("Loadout transferred to slot {slot}{pieces}"))
     }
   }
 
@@ -1202,41 +1295,41 @@ impl GuiApp {
       .equip_piece_source_text
       .trim()
       .parse::<usize>()
-      .map_err(|_| "来源槽位必须是数字")?;
+      .map_err(|_| "Source slot must be a number")?;
     let target_index = self
       .equip_piece_target_text
       .trim()
       .parse::<usize>()
-      .map_err(|_| "目标槽位必须是数字")?;
+      .map_err(|_| "Target slot must be a number")?;
     {
       let Some(source) = self.source.as_ref() else {
-        return Err("尚未打开来源存档".to_owned());
+        return Err("No source save is open".to_owned());
       };
       let Some(target) = self.target.as_mut() else {
-        return Err("尚未打开目标存档".to_owned());
+        return Err("No target save is open".to_owned());
       };
       edit::copy_equip_piece(target.document.payload_mut(), source.document.payload(), source_index, target_index)
         .map_err(|error| error.to_string())?;
       self.dirty = true;
-      Ok(format!("装备已从来源槽位 {source_index} 转移到目标槽位 {target_index}"))
+      Ok(format!("Gear moved from source slot {source_index} to target slot {target_index}"))
     }
   }
 
   fn show_transfer_tab(&mut self, ui: &mut egui::Ui) {
     if self.target.is_none() {
-      ui.label("先用顶部“快速选择”或“浏览…”选定目标存档并点“打开存档”,再进行转移。");
+      ui.label("Open the target save first (Quick select or Browse above, then Open save) before transferring.");
       return;
     }
-    ui.label("把“来源存档”的数据合并进“目标存档”(同一 Steam 账号):");
+    ui.label("Merge data from the source save into the target save (same Steam account):");
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-      ui.label("来源快速选择");
+      ui.label("Source quick select");
       let selected = self
         .discovered
         .iter()
         .find(|(path, _, _)| path.display().to_string() == self.source_path)
         .map(|(_, label, _)| label.clone())
-        .unwrap_or_else(|| "(未选择)".to_owned());
+        .unwrap_or_else(|| "(none selected)".to_owned());
       egui::ComboBox::from_id_salt("discovered-sources").selected_text(selected).show_ui(ui, |ui| {
         for (path, label, account) in &self.discovered {
           if ui.selectable_value(&mut self.source_path, path.display().to_string(), label).clicked()
@@ -1245,20 +1338,20 @@ impl GuiApp {
             // The save folder name is the 32-bit account id; derive the
             // SteamID64 automatically so users never have to look it up.
             self.steamid64 = steamid64_from_account(*account).to_string();
-            let note = format!("已根据存档路径自动填入 SteamID64: {}\n", self.steamid64);
+            let note = format!("SteamID64 filled in from the save path: {}\n", self.steamid64);
             self.log.push_str(&note);
           }
         }
       });
-      ui.label("(与目标相同则无需转移)");
+      ui.label("(no need to transfer if same as target)");
     });
     Grid::new("transfer").num_columns(3).spacing([8.0, 6.0]).show(ui, |ui| {
-      ui.label("来源存档");
+      ui.label("Source save");
       ui.add_sized([420.0, 20.0], egui::TextEdit::singleline(&mut self.source_path));
-      if ui.add_enabled(!self.busy, egui::Button::new("浏览…")).clicked()
+      if ui.add_enabled(!self.busy, egui::Button::new("Browse…")).clicked()
         && let Some(path) = rfd::FileDialog::new()
-          .add_filter("MHRise 存档", &["bin"])
-          .set_title("选择来源存档")
+          .add_filter("MH Rise save", &["bin"])
+          .set_title("Choose source save")
           .pick_file()
       {
         self.source_path = path.display().to_string();
@@ -1271,7 +1364,7 @@ impl GuiApp {
         && steamid.is_ok()
         && !self.source_path.trim().is_empty()
         && self.source.is_none();
-      if ui.add_enabled(open_ready, egui::Button::new("打开来源存档")).clicked() {
+      if ui.add_enabled(open_ready, egui::Button::new("Open source save")).clicked() {
         let task = WorkerTask::Open {
           path: PathBuf::from(self.source_path.trim()),
           steamid64: steamid.expect("checked"),
@@ -1280,28 +1373,28 @@ impl GuiApp {
         self.spawn(ui.ctx(), task);
       }
       if self.source.is_some()
-        && ui.add_enabled(!self.busy, egui::Button::new("卸载来源存档")).clicked()
+        && ui.add_enabled(!self.busy, egui::Button::new("Unload source save")).clicked()
       {
         self.source = None;
-        self.log_line("已卸载来源存档");
+        self.log_line("Source save unloaded");
       }
       if let Some(source) = &self.source {
-        ui.label(format!("来源: {} ({})", source.path.display(), source.summary()));
+        ui.label(format!("Source: {} ({})", source.path.display(), source.summary()));
       }
     });
 
     ui.add_space(6.0);
     ui.separator();
-    ui.heading("道具箱转移");
+    ui.heading("Item Box transfer");
     ui.horizontal(|ui| {
-      ui.label("取自来源的类别:");
+      ui.label("Categories taken from source:");
       for ((label, _), on) in ITEM_CATEGORY_GROUPS.iter().zip(&mut self.xfer_cats) {
         ui.checkbox(on, *label);
       }
-      if ui.small_button("全选").clicked() {
+      if ui.small_button("Select all").clicked() {
         self.xfer_cats.iter_mut().for_each(|on| *on = true);
       }
-      if ui.small_button("清空").clicked() {
+      if ui.small_button("Clear").clicked() {
         self.xfer_cats.iter_mut().for_each(|on| *on = false);
       }
     });
@@ -1309,71 +1402,71 @@ impl GuiApp {
       let both_ready = !self.busy && self.source.is_some();
       let any_cat = self.xfer_cats.iter().any(|on| *on);
       if ui
-        .add_enabled(both_ready && any_cat, egui::Button::new("转移道具箱 (按类别合并)"))
+        .add_enabled(both_ready && any_cat, egui::Button::new("Transfer Item Box (merge by category)"))
         .clicked()
       {
         match self.transfer_items_filtered() {
-          Ok(text) => self.log_line(&format!("✔ {text} (内存中)")),
+          Ok(text) => self.log_line(&format!("✔ {text} (in memory)")),
           Err(error) => self.log_line(&format!("✘ {error}")),
         }
       }
-      ui.label("仅勾选类别的槽位取自来源,其余保留目标原样;全部勾选 = 完整替换");
+      ui.label("Only slots in ticked categories are taken from the source; the rest stay as in the target. All ticked = full replacement");
     });
 
     ui.add_space(6.0);
     ui.separator();
-    ui.heading("进度转移");
+    ui.heading("Progress transfer");
     ui.horizontal(|ui| {
-      ui.checkbox(&mut self.xfer_progress, "等级进度 (HR/MR/怪异研究等级 + 点数)");
+      ui.checkbox(&mut self.xfer_progress, "Rank progress (HR / MR / Anomaly Research rank + points)");
     });
     ui.horizontal(|ui| {
       let both_ready = !self.busy && self.source.is_some() && self.xfer_progress;
-      if ui.add_enabled(both_ready, egui::Button::new("转移等级进度")).clicked() {
+      if ui.add_enabled(both_ready, egui::Button::new("Transfer rank progress")).clicked() {
         match self.transfer_progress() {
-          Ok(text) => self.log_line(&format!("✔ {text} (内存中)")),
+          Ok(text) => self.log_line(&format!("✔ {text} (in memory)")),
           Err(error) => self.log_line(&format!("✘ {error}")),
         }
       }
-      ui.label("⚠ 新档未完成解禁任务时,转移后的等级仍会被游戏钳制在当前上限内");
+      ui.label("! If the target has not finished the unlock quests, the game still clamps the transferred ranks to the current cap");
     });
 
     ui.add_space(6.0);
     ui.separator();
-    ui.heading("装备转移");
+    ui.heading("Equipment transfer");
     ui.horizontal(|ui| {
-      ui.checkbox(&mut self.xfer_equip_box, "装备箱 (武器/防具/护石)");
-      ui.checkbox(&mut self.xfer_equip_manager, "穿着与装备组合登记");
-      ui.checkbox(&mut self.xfer_item_my_set, "道具袋组合");
+      ui.checkbox(&mut self.xfer_equip_box, "Equipment Box (weapons / armor / talismans)");
+      ui.checkbox(&mut self.xfer_equip_manager, "Worn gear and loadout registry");
+      ui.checkbox(&mut self.xfer_item_my_set, "Item pouch loadouts");
     });
     ui.horizontal(|ui| {
       let both_ready = !self.busy && self.source.is_some();
       let any_part = self.xfer_equip_box || self.xfer_equip_manager || self.xfer_item_my_set;
       if ui
-        .add_enabled(both_ready && any_part, egui::Button::new("转移装备 (按所选组件)"))
+        .add_enabled(both_ready && any_part, egui::Button::new("Transfer equipment (selected parts)"))
         .clicked()
       {
         match self.transfer_equipment_selected() {
-          Ok(text) => self.log_line(&format!("✔ {text} (内存中)")),
+          Ok(text) => self.log_line(&format!("✔ {text} (in memory)")),
           Err(error) => self.log_line(&format!("✘ {error}")),
         }
       }
     });
     if !(self.xfer_equip_box && self.xfer_equip_manager && self.xfer_item_my_set) {
       ui.colored_label(
-        egui::Color32::LIGHT_YELLOW,
-        "⚠ 部分转移时,装备组合/穿着引用的装备箱序号可能对应不同装备,进游戏后请先检查",
+        self.theme.palette().accent,
+        "! In a partial transfer, Equipment Box indexes referenced by loadouts or worn gear may point to different gear; check in game",
       );
     }
-    ui.label("转移在内存中立即生效;确认无误后用下方“保存为新文件”写盘。");
+    ui.label("Transfers apply in memory at once; when it looks right, write to disk with Save as new file below.");
   }
 
   fn show_progress_tab(&mut self, ui: &mut egui::Ui) {
     if self.target.is_none() {
-      ui.label("先用顶部“快速选择”或“浏览…”打开一个存档。");
+      ui.label("Open a save first (Quick select or Browse above).");
       return;
     }
-    ui.heading("等级与累计点数");
-    ui.label("点数是升级时的累计进度,等级钳制解除后游戏按点数推进等级;留空 = 不修改。");
+    ui.heading("Ranks and accumulated points");
+    ui.label("Points are the running progress toward the next rank; once the clamp is lifted the game advances the rank from them. Blank = no change.");
     ui.add_space(4.0);
     Grid::new("progress-points").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
       let row = |ui: &mut egui::Ui, label: &str, text: &mut String| {
@@ -1381,49 +1474,49 @@ impl GuiApp {
         ui.add_sized([200.0, 20.0], egui::TextEdit::singleline(text));
         ui.end_row();
       };
-      row(ui, "猎人等级点数 (HR Point)", &mut self.hr_point_input);
-      row(ui, "大师等级点数 (MR Point)", &mut self.mr_point_input);
-      row(ui, "怪异研究点数", &mut self.mystery_point_input);
+      row(ui, "Hunter Rank points (HR)", &mut self.hr_point_input);
+      row(ui, "Master Rank points (MR)", &mut self.mr_point_input);
+      row(ui, "Anomaly Research points", &mut self.mystery_point_input);
     });
     ui.horizontal(|ui| {
-      if ui.add_enabled(!self.busy, egui::Button::new("应用点数修改")).clicked() {
+      if ui.add_enabled(!self.busy, egui::Button::new("Apply point changes")).clicked() {
         match self.apply_point_edits() {
-          Ok(text) => self.log_line(&format!("✔ {text} (内存中)")),
+          Ok(text) => self.log_line(&format!("✔ {text} (in memory)")),
           Err(error) => self.log_line(&format!("✘ {error}")),
         }
       }
-      ui.label("(点数仅是进度累积,不改变解禁钳制;1 ≤ 值 ≤ 99999999)");
+      ui.label("(points are only accumulated progress and do not change the unlock clamp; 1 ≤ value ≤ 99999999)");
     });
 
     ui.add_space(8.0);
     ui.separator();
-    ui.heading("名片解禁标志 (显示副本)");
+    ui.heading("Guild card unlock flags (display copy)");
     ui.horizontal_wrapped(|ui| {
       for ((_, label), on) in edit::GUILD_FLAGS.iter().zip(&mut self.guild_flags) {
         ui.checkbox(on, *label);
       }
     });
     ui.horizontal(|ui| {
-      if ui.add_enabled(!self.busy, egui::Button::new("应用名片标志")).clicked() {
+      if ui.add_enabled(!self.busy, egui::Button::new("Apply card flags")).clicked() {
         let values: Vec<(u32, bool)> = edit::GUILD_FLAGS
           .iter()
           .zip(&self.guild_flags)
           .map(|((hash, _), on)| (*hash, *on))
           .collect();
         match self.apply_guild_flags(&values) {
-          Ok(text) => self.log_line(&format!("✔ {text} (内存中)")),
+          Ok(text) => self.log_line(&format!("✔ {text} (in memory)")),
           Err(error) => self.log_line(&format!("✘ {error}")),
         }
       }
-      ui.label("这些是猎人名片上的显示副本;实测解禁钳制不完全由它们决定");
+      ui.label("These are display copies on the hunter card; in testing the unlock clamp is not fully decided by them");
     });
 
     ui.add_space(8.0);
     ui.separator();
-    ui.heading("为什么改了等级却不生效?");
-    ui.label("· 游戏对等级有解禁钳制:未完成对应解禁任务链时,读档会提示获得成就,但显示等级仍被压回当前上限");
-    ui.label("· 解禁状态记录在任务清通标志位图中(打包结构,任务到位的映射需要游戏数据表),本工具暂不自动改写");
-    ui.label("· 想让新档达到高等级:在游戏内完成解禁任务,或用“存档转移”把高等级档的装备/道具/等级进度搬过来(解禁仍受任务进度约束)");
+    ui.heading("Why does my rank change not stick?");
+    ui.label("· The game clamps ranks: until the matching unlock quest chain is done, loading shows an achievement popup but the displayed rank is pushed back to the current cap");
+    ui.label("· Unlock state lives in a packed quest-clear bitmap (mapping quests to bits needs the game data tables), which this tool does not rewrite yet");
+    ui.label("· To get a new save to a high rank: finish the unlock quests in game, or use Transfer to move gear / items / rank progress from a high-rank save (unlocks are still bound by quest progress)");
   }
 
   /// Applies the three point-accumulator edits from the 进度与解禁 tab.
@@ -1433,17 +1526,17 @@ impl GuiApp {
       if trimmed.is_empty() {
         return Ok(None);
       }
-      let value = trimmed.parse::<u32>().map_err(|_| format!("{name} 必须是数字: {text:?}"))?;
+      let value = trimmed.parse::<u32>().map_err(|_| format!("{name} must be a number: {text:?}"))?;
       if value == 0 || value > 99_999_999 {
-        return Err(format!("{name} 超出范围 (1-99999999): {value}"));
+        return Err(format!("{name} out of range (1-99999999): {value}"));
       }
       Ok(Some(value))
     };
-    let hr = parse(&self.hr_point_input, "猎人等级点数")?;
-    let mr = parse(&self.mr_point_input, "大师等级点数")?;
-    let mystery = parse(&self.mystery_point_input, "怪异研究点数")?;
+    let hr = parse(&self.hr_point_input, "Hunter Rank points")?;
+    let mr = parse(&self.mr_point_input, "Master Rank points")?;
+    let mystery = parse(&self.mystery_point_input, "Anomaly Research points")?;
     let Some(opened) = self.target.as_mut() else {
-      return Err("尚未打开目标存档".to_owned());
+      return Err("No target save is open".to_owned());
     };
     let mut applied = 0usize;
     for (value, hash, label) in [
@@ -1461,20 +1554,20 @@ impl GuiApp {
       }
     }
     if applied == 0 {
-      return Err("没有可应用的修改".to_owned());
+      return Err("Nothing to apply".to_owned());
     }
     self.dirty = true;
-    Ok(format!("更新了 {applied} 项点数"))
+    Ok(format!("Updated {applied} point values"))
   }
 
   /// Copies ProgressSaveData (ranks + point accumulators) from the source.
   fn transfer_progress(&mut self) -> Result<String, String> {
     {
       let Some(source) = self.source.as_ref() else {
-        return Err("尚未打开来源存档".to_owned());
+        return Err("No source save is open".to_owned());
       };
       let Some(target) = self.target.as_mut() else {
-        return Err("尚未打开目标存档".to_owned());
+        return Err("No target save is open".to_owned());
       };
       edit::copy_class_fields(
         target.document.payload_mut(),
@@ -1490,7 +1583,7 @@ impl GuiApp {
       .as_ref()
       .and_then(|target| edit::read_ranks(target.document.payload()));
     Ok(format!(
-      "等级进度转移完成;目标现为 HR {} / MR {} / 怪异研究 {}",
+      "Rank progress transferred; target is now HR {} / MR {} / Anomaly {}",
       ranks.map(|r| r.hunter).unwrap_or(0),
       ranks.map(|r| r.master).unwrap_or(0),
       ranks.map(|r| r.mystery_research).unwrap_or(0)
@@ -1500,41 +1593,41 @@ impl GuiApp {
   /// Applies guild card unlock flags from the 进度与解禁 tab.
   fn apply_guild_flags(&mut self, values: &[(u32, bool)]) -> Result<String, String> {
     let Some(opened) = self.target.as_mut() else {
-      return Err("尚未打开目标存档".to_owned());
+      return Err("No target save is open".to_owned());
     };
     let updated = edit::set_guild_flags(opened.document.payload_mut(), values)
       .map_err(|error| error.to_string())?;
     self.dirty = true;
-    Ok(format!("更新了 {updated} 个名片标志"))
+    Ok(format!("Updated {updated} card flags"))
   }
 
   fn show_backup_tab(&mut self, ui: &mut egui::Ui) {
     let Some(target_dir) = self.target.as_ref().map(|opened| opened.path.parent().map(Path::to_path_buf)).flatten() else {
-      ui.label("先用顶部“快速选择”或“浏览…”打开一个存档,才能定位其存档目录。");
+      ui.label("Open a save first (Quick select or Browse above) so its save folder can be located.");
       return;
     };
-    ui.label(format!("当前存档目录: {}", target_dir.display()));
+    ui.label(format!("Current save folder: {}", target_dir.display()));
     ui.label(
-      "备份把整个存档目录原样复制到 文档\\MHR-Save-Backups\\<账号>\\<时间戳>,逐字节校验,且位于 Steam 云同步范围之外;",
+      "A backup copies the whole save folder as-is to Documents\\MHR-Save-Backups\\<account>\\<timestamp>, verified byte by byte and outside Steam Cloud sync;",
     );
-    ui.label("还原则把所选备份覆盖回存档目录——覆盖前请关闭游戏,并且不要与 Steam 云同步同时进行。");
+    ui.label("Restore copies the chosen backup over the save folder. Close the game first and do not restore while Steam Cloud is syncing.");
     ui.add_space(6.0);
     ui.horizontal(|ui| {
-      if ui.add_enabled(!self.busy, egui::Button::new("备份整个存档目录")).clicked() {
+      if ui.add_enabled(!self.busy, egui::Button::new("Back up whole save folder")).clicked() {
         self.spawn(ui.ctx(), WorkerTask::Backup { dir: target_dir.clone() });
       }
       ui.label(format!(
-        "已有备份 {} 份",
+        "{} backups found",
         backups_for_target(&target_dir).map(|list| list.len()).unwrap_or(0)
       ));
     });
 
     ui.add_space(6.0);
     ui.separator();
-    ui.heading("已有备份 (新在前)");
+    ui.heading("Existing backups (newest first)");
     let backups = backups_for_target(&target_dir).unwrap_or_default();
     if backups.is_empty() {
-      ui.label("(尚无备份;强烈建议在第一次编辑前备份一次)");
+      ui.label("(no backups yet; back up once before your first edit)");
       return;
     }
     egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
@@ -1542,21 +1635,21 @@ impl GuiApp {
         ui.horizontal(|ui| {
           ui.label(backup.file_name().and_then(|name| name.to_str()).unwrap_or("?").to_owned());
           let armed = self.restore_confirm.as_deref() == Some(backup.as_path());
-          let label = if armed { "⚠ 再次点击确认还原" } else { "还原此备份" };
+          let label = if armed { "! Click again to confirm restore" } else { "Restore this backup" };
           if ui.add_enabled(!self.busy, egui::Button::new(label)).clicked() {
             if armed {
               self.restore_confirm = None;
-              self.log_line(&format!("▶ 正在还原 {} …", backup.display()));
+              self.log_line(&format!("▶ Restoring {} …", backup.display()));
               self.spawn(ui.ctx(), WorkerTask::Restore {
                 backup: backup.clone(),
                 target_dir: target_dir.clone(),
               });
             } else {
               self.restore_confirm = Some(backup.clone());
-              self.log_line("⚠ 还原会覆盖存档目录中的全部文件;再点一次“还原此备份”确认");
+              self.log_line("! Restore overwrites every file in the save folder; click Restore this backup again to confirm");
             }
           }
-          if armed && ui.small_button("取消").clicked() {
+          if armed && ui.small_button("Cancel").clicked() {
             self.restore_confirm = None;
           }
         });
@@ -1565,35 +1658,35 @@ impl GuiApp {
   }
 
   fn show_help_tab(&mut self, ui: &mut egui::Ui) {
-    ui.label(r"存档目录: <Steam库>\userdata\<32位账号ID>\1446780\remote\win64_save");
-    ui.label(r"· Steam 默认装在 C:\Program Files (x86)\Steam;自定义库在其它盘(例如 D:\Steam)。启动时已自动扫描所有 Steam 库。");
-    ui.label("· 角色存档: data001Slot.bin ~ data003Slot.bin(游戏内最多 3 个角色槽,即读档界面的 3 个存档位)");
-    ui.label("· 系统存档: data00-1.bin(全局数据,一般不需要修改);SS1_* / SS4_* / SS7_* 是相册数据");
+    ui.label(r"Save folder: <Steam library>\userdata\<32-bit account id>\1446780\remote\win64_save");
+    ui.label(r"· Steam installs to C:\Program Files (x86)\Steam by default; custom libraries may be on other drives (for example D:\Steam). All Steam libraries are scanned at startup.");
+    ui.label("· Character saves: data001Slot.bin ~ data003Slot.bin (up to 3 character slots in game)");
+    ui.label("· System save: data00-1.bin (global data, normally not edited); SS1_* / SS4_* / SS7_* are album data");
     ui.label(
-      "· 推荐流程: 备份 → 编辑 → 写入原存档(自动先备份整个目录)→ 进游戏确认;“保存为新文件”则输出 <原名>.edited.bin,需手动替换原文件",
+      "· Recommended flow: back up → edit → write to save (backs up the whole folder first) → check in game. Save as new file writes <name>.edited.bin that you must swap in by hand",
     );
-    ui.label("· Steam 云同步: 编辑时建议让 Steam 离线,避免云端旧档覆盖");
-    ui.label("· 角色存档必须由游戏创建过(空槽没有引导存档时,游戏不会识别放入的文件)");
+    ui.label("· Steam Cloud: go offline in Steam while editing so an older cloud save cannot overwrite it");
+    ui.label("· The character save must already exist (the game will not recognise a file dropped into an empty slot)");
     ui.add_space(8.0);
-    ui.heading("中文无法输入/没有候选词?");
-    ui.label("· 本程序基于 winit 窗口库,与 TSF 模式的输入法存在已知兼容性问题(打字被吞、无候选词)");
-    ui.label("· 微软拼音: 设置 → 时间和语言 → 语言和区域 → 中文 → 微软拼音 → 常规 → 兼容性 → 打开「使用以前版本的 Microsoft 输入法」");
-    ui.label("· 搜狗等第三方输入法: 若同样无效,属于同一兼容性问题,可临时切换到已开启兼容模式的微软拼音;此问题影响所有 winit 应用,与本工具的存档逻辑无关");
+    ui.heading("Cannot type Chinese / no candidate window?");
+    ui.label("· This app uses the winit window library, which has a known compatibility problem with TSF-mode input methods (keys swallowed, no candidate list)");
+    ui.label("· Microsoft Pinyin: Settings → Time & language → Language & region → Chinese → Microsoft Pinyin → General → Compatibility → turn on 'Use previous version of Microsoft IME'");
+    ui.label("· Sogou and other third-party IMEs: if they fail too, it is the same compatibility problem; switch to Microsoft Pinyin in compatibility mode. This affects every winit app and has nothing to do with this tool");
   }
 
   fn show_save_bar(&mut self, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
       let ready = !self.busy && self.target.is_some();
-      if ui.add_enabled(ready, egui::Button::new("写入原存档 (先自动备份)")).clicked() {
+      if ui.add_enabled(ready, egui::Button::new("Write to save (backs up first)")).clicked() {
         self.save_target_in_place(ui);
       }
-      if ui.add_enabled(ready, egui::Button::new("保存为新文件")).clicked() {
+      if ui.add_enabled(ready, egui::Button::new("Save as new file")).clicked() {
         self.save_target_to_new_file(ui);
       }
       if self.dirty {
-        ui.label("● 有未保存修改 (内存中)");
+        ui.label("● Unsaved changes (in memory)");
       }
-      ui.label("关闭游戏后再写入;“写入原存档”会先把整个存档目录备份到 文档\\MHR-Save-Backups");
+      ui.label("Close the game before writing; Write to save backs up the whole save folder to Documents\\MHR-Save-Backups first");
     });
   }
 
@@ -1607,12 +1700,19 @@ impl GuiApp {
     };
     (0..opened.box_items.len())
       .filter(|&index| {
+        let (id, num) = opened.box_items[index];
+        if !self.box_show_empty && num == 0 {
+          return false;
+        }
+        if self.box_category != 0 && category_group(id) != self.box_category - 1 {
+          return false;
+        }
         if filter.is_empty() {
           return true;
         }
-        let (id, _) = opened.box_items[index];
         let category = crate::items::item_category(id).unwrap_or("");
         crate::items::item_name_cn(id).unwrap_or("").contains(filter)
+          || crate::items::item_name_en(id).unwrap_or("").to_lowercase().contains(filter)
           || category.to_lowercase().contains(filter)
           || crate::items::item_name(id).unwrap_or("").to_lowercase().contains(filter)
           || format!("{id:08x}").contains(filter)
@@ -1732,7 +1832,7 @@ fn discover_steam_slot_files() -> Vec<(PathBuf, String, Option<u32>)> {
           .and_then(|account| account.file_name())
           .map(|name| name.to_string_lossy().to_string())
           .unwrap_or_default();
-        files.push((path, format!("账号 {account} / {name}"), account.parse::<u32>().ok()));
+        files.push((path, format!("Account {account} / {name}"), account.parse::<u32>().ok()));
       }
     }
   }
