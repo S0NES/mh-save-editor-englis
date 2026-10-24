@@ -2,10 +2,11 @@
 //!
 //! Model: open a save once (background thread — decryption takes seconds),
 //! edit values in memory (instant), then write the result to a NEW file
-//! (`保存为新文件`). The selected save itself is never modified; the user
+//! (`Save as new file`). The selected save itself is never modified; the user
 //! swaps the output file in with the game closed.
 
 use std::{
+  collections::BTreeSet,
   fs,
   path::{Path, PathBuf},
   sync::mpsc::{self, Receiver, TryRecvError},
@@ -17,7 +18,14 @@ use std::{
 use eframe::egui;
 use egui::Grid;
 
-use crate::{container::SteamSave, edit, format::parse_header, game::Game, theme::Theme};
+use crate::{
+  container::SteamSave,
+  edit,
+  format::parse_header,
+  game::Game,
+  itembox::{self, SortKey},
+  theme::Theme,
+};
 
 const TAB_INFO: usize = 0;
 const TAB_PLAYER: usize = 1;
@@ -33,13 +41,13 @@ const TAB_HELP: usize = 7;
 /// used directly. Returns a status line for the on-screen log.
 fn install_cjk_font(ctx: &egui::Context) -> String {
   for (path, label) in [
-    ("C:/Windows/Fonts/msyh.ttc", "微软雅黑 (msyh.ttc)"),
-    ("C:/Windows/Fonts/msjh.ttc", "微軟正黑體 (msjh.ttc)"),
-    ("C:/Windows/Fonts/simsun.ttc", "宋体 (simsun.ttc)"),
-    ("C:/Windows/Fonts/Deng.ttf", "等线 (Deng.ttf)"),
-    ("C:/Windows/Fonts/simhei.ttf", "黑体 (simhei.ttf)"),
-    ("C:/Windows/Fonts/Dengb.ttf", "等线粗体 (Dengb.ttf)"),
-    ("C:/Windows/Fonts/STXIHEI.TTF", "华文细黑 (STXIHEI.TTF)"),
+    ("C:/Windows/Fonts/msyh.ttc", "Microsoft YaHei (msyh.ttc)"),
+    ("C:/Windows/Fonts/msjh.ttc", "Microsoft JhengHei (msjh.ttc)"),
+    ("C:/Windows/Fonts/simsun.ttc", "SimSun (simsun.ttc)"),
+    ("C:/Windows/Fonts/Deng.ttf", "DengXian (Deng.ttf)"),
+    ("C:/Windows/Fonts/simhei.ttf", "SimHei (simhei.ttf)"),
+    ("C:/Windows/Fonts/Dengb.ttf", "DengXian Bold (Dengb.ttf)"),
+    ("C:/Windows/Fonts/STXIHEI.TTF", "STXihei (STXIHEI.TTF)"),
   ] {
     let Ok(bytes) = fs::read(path) else {
       continue;
@@ -117,6 +125,15 @@ pub struct GuiApp {
   /// Index into [`ITEM_CATEGORY_GROUPS`] + 1; 0 = all categories.
   box_category: usize,
   box_show_empty: bool,
+  /// Slot indices (0-based) ticked for bulk actions.
+  box_selected: BTreeSet<usize>,
+  /// Row position (in the visible list) of the last checkbox click, for
+  /// shift-click range selection.
+  box_last_clicked: Option<usize>,
+  box_bulk_qty: String,
+  box_move_slot: String,
+  /// Index into [`SortKey::ALL`].
+  box_sort: usize,
   box_edits: Vec<String>,
   game: Game,
   theme: Theme,
@@ -131,18 +148,18 @@ pub struct GuiApp {
   xfer_equip_box: bool,
   xfer_equip_manager: bool,
   xfer_item_my_set: bool,
-  /// Backup awaiting a second confirming click on 还原.
+  /// Backup awaiting a second confirming click on Restore.
   restore_confirm: Option<PathBuf>,
-  /// Point-accumulator inputs on the 进度与解禁 tab (HR/MR/anomaly research).
+  /// Point-accumulator inputs on the Progress tab (HR/MR/anomaly research).
   hr_point_input: String,
   mr_point_input: String,
   mystery_point_input: String,
-  /// Unlock-flag toggles on the 进度与解禁 tab, parallel to
+  /// Unlock-flag toggles on the Progress tab, parallel to
   /// [`edit::GUILD_FLAGS`].
   guild_flags: Vec<bool>,
   /// Transfer toggle: copy ProgressSaveData (ranks + points).
   xfer_progress: bool,
-  /// 装备组合 tab state: selected source register, target slot text
+  /// Loadouts tab state: selected source register, target slot text
   /// (empty = append to the first free slot), and the single-piece inputs.
   equip_source_combo: usize,
   equip_target_slot_text: String,
@@ -152,7 +169,7 @@ pub struct GuiApp {
 }
 
 /// (label, item-table categories) groups for the item-box transfer filter.
-/// Ids missing from the name table follow the last ("其它/未知") toggle.
+/// Ids missing from the name table follow the last ("Tools / Other") toggle.
 const ITEM_CATEGORY_GROUPS: &[(&str, &[&str])] = &[
   ("Consumables", &["Consume"]),
   ("Materials", &["Material", "OffcutsMaterial"]),
@@ -160,6 +177,19 @@ const ITEM_CATEGORY_GROUPS: &[(&str, &[&str])] = &[
   ("Sell / Antiques", &["PayOff", "CarryPayOff", "Antique"]),
   ("Tools / Other", &["Tool"]),
 ];
+
+/// Runs `add` inside a fixed-width, fixed-height cell so table columns line
+/// up no matter how wide the content is.
+fn cell<R>(
+  ui: &mut egui::Ui,
+  width: f32,
+  layout: egui::Layout,
+  add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+  let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 18.0), egui::Sense::hover());
+  let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(layout));
+  add(&mut child)
+}
 
 /// Which [`ITEM_CATEGORY_GROUPS`] entry an item id belongs to; ids missing
 /// from the name table fall into the last group.
@@ -417,7 +447,7 @@ impl GuiApp {
     let other_allowed = *self.xfer_cats.last().unwrap_or(&false);
     let keep = move |id: u32| match crate::items::item_category(id) {
       Some(category) => groups.iter().any(|group| group.contains(&category)),
-      // Ids missing from the name table follow the 其它/未知 toggle.
+      // Ids missing from the name table follow the "Tools / Other" toggle.
       None => other_allowed,
     };
     let Some(target) = self.target.as_mut() else {
@@ -1088,73 +1118,240 @@ impl GuiApp {
     let filter = self.box_filter.trim().to_lowercase();
     let rows = self.visible_box_rows(&filter);
     let muted = self.theme.palette().ink_muted;
+    let danger = self.theme.palette().danger;
+    let selected_count = self.box_selected.len();
+    let actionable = !self.busy && selected_count > 0;
     ui.horizontal(|ui| {
-      for (width, text) in [(52.0, "Slot"), (240.0, "Name"), (90.0, "Category"), (84.0, "ID"), (72.0, "Qty")] {
-        ui.add_sized(
-          [width, 16.0],
-          egui::Label::new(egui::RichText::new(text).small().strong().color(muted)),
-        );
+      ui.label(format!("{selected_count} selected"));
+      if ui.button("Select all shown").clicked() {
+        let with_items: Vec<usize> =
+          rows.iter().copied().filter(|&index| self.box_slot_has_item(index)).collect();
+        self.box_selected.extend(with_items);
       }
-      ui.label(egui::RichText::new("New qty").small().strong().color(muted));
+      if ui.add_enabled(selected_count > 0, egui::Button::new("Clear selection")).clicked() {
+        self.box_selected.clear();
+        self.box_last_clicked = None;
+      }
+      ui.separator();
+      ui.label("Set quantity");
+      ui.add_sized(
+        [60.0, 20.0],
+        egui::TextEdit::singleline(&mut self.box_bulk_qty).hint_text("0-9999"),
+      );
+      if ui.add_enabled(actionable, egui::Button::new("Set")).clicked() {
+        let result = self.box_set_quantity_selected();
+        self.log_box_result(result);
+      }
+      let delete_label = egui::RichText::new("Delete selected").color(danger);
+      if ui.add_enabled(actionable, egui::Button::new(delete_label)).clicked() {
+        let result = self.box_delete_selected();
+        self.log_box_result(result);
+      }
     });
-    egui::ScrollArea::vertical().max_height(320.0).auto_shrink(false).show_rows(
+    ui.horizontal(|ui| {
+      ui.label("Move selection to slot");
+      ui.add_sized(
+        [60.0, 20.0],
+        egui::TextEdit::singleline(&mut self.box_move_slot).hint_text("1-1800"),
+      );
+      if ui.add_enabled(actionable, egui::Button::new("Move")).clicked() {
+        let result = self.box_move_selected();
+        self.log_box_result(result);
+      }
+      ui.separator();
+      ui.label("Sort box by");
+      let current = SortKey::ALL[self.box_sort].label();
+      egui::ComboBox::from_id_salt("box-sort").selected_text(current).show_ui(ui, |ui| {
+        for (i, key) in SortKey::ALL.iter().enumerate() {
+          ui.selectable_value(&mut self.box_sort, i, key.label());
+        }
+      });
+      if ui.add_enabled(!self.busy, egui::Button::new("Sort (empty slots go last)")).clicked() {
+        let result = self.box_sort_all();
+        self.log_box_result(result);
+      }
+    });
+    ui.horizontal(|ui| {
+      let left = egui::Layout::left_to_right(egui::Align::Center);
+      let right = egui::Layout::right_to_left(egui::Align::Center);
+      let header = |text: &str| egui::RichText::new(text.to_owned()).small().strong().color(muted);
+      for (width, text) in [(24.0, ""), (52.0, "Slot"), (240.0, "Name"), (90.0, "Category"), (84.0, "ID")] {
+        cell(ui, width, left, |ui| ui.label(header(text)));
+      }
+      cell(ui, 72.0, right, |ui| ui.label(header("Qty")));
+      cell(ui, 90.0, left, |ui| ui.label(header("New qty")));
+    });
+    egui::ScrollArea::vertical().max_height(300.0).auto_shrink(false).show_rows(
       ui,
-      20.0,
+      22.0,
       rows.len(),
       |ui, range| {
         for row in range {
           let index = rows[row];
-          self.show_item_row(ui, index);
+          let Some(checked) = self.show_item_row(ui, index) else {
+            continue;
+          };
+          let shift = ui.input(|input| input.modifiers.shift);
+          let affected: Vec<usize> = match (shift, self.box_last_clicked) {
+            (true, Some(last)) => {
+              let (from, to) = (last.min(row), last.max(row));
+              rows[from..=to].iter().copied().filter(|&i| self.box_slot_has_item(i)).collect()
+            }
+            _ => vec![index],
+          };
+          for slot in affected {
+            if checked {
+              self.box_selected.insert(slot);
+            } else {
+              self.box_selected.remove(&slot);
+            }
+          }
+          self.box_last_clicked = Some(row);
         }
       },
     );
     ui.label(format!(
-      "Showing {} of {} slots; leave New qty blank = no change; enter 0 = clear the item",
+      "Showing {} of {} slots. Tick rows (shift-click for a range) to edit many at once. \
+       Per row: leave New qty blank = no change, 0 = clear the item.",
       rows.len(),
       self.box_items_len()
     ));
   }
 
-  fn show_item_row(&mut self, ui: &mut egui::Ui, index: usize) {
-    let Some((id, num)) = self.target.as_ref().map(|opened| opened.box_items[index]) else {
-      return;
+  fn box_slot_has_item(&self, index: usize) -> bool {
+    self.target.as_ref().is_some_and(|opened| opened.box_items.get(index).is_some_and(|slot| slot.1 > 0))
+  }
+
+  fn log_box_result(&mut self, result: Result<String, String>) {
+    match result {
+      Ok(text) => self.log_line(&format!("✔ {text} (in memory)")),
+      Err(error) => self.log_line(&format!("✘ {error}")),
+    }
+  }
+
+  /// Rewrites the target's whole item box: `build` edits a copy of the layout
+  /// and returns a status line, then the result is written into the save.
+  fn rewrite_box(
+    &mut self,
+    build: impl FnOnce(&mut Vec<(u32, u32)>) -> Result<String, String>,
+  ) -> Result<String, String> {
+    let Some(opened) = self.target.as_mut() else {
+      return Err("No target save is open".to_owned());
     };
+    let mut layout = opened.box_items.clone();
+    let message = build(&mut layout)?;
+    edit::write_item_box(opened.document.payload_mut(), &layout)
+      .map_err(|error| error.to_string())?;
+    opened.box_items = edit::read_item_box(opened.document.payload())
+      .map_err(|error| error.to_string())?
+      .into_iter()
+      .map(|entry| (entry.id, entry.num))
+      .collect();
+    self.box_edits = vec![String::new(); opened.box_items.len()];
+    self.box_last_clicked = None;
+    self.dirty = true;
+    Ok(message)
+  }
+
+  fn box_delete_selected(&mut self) -> Result<String, String> {
+    let selected: Vec<usize> = self.box_selected.iter().copied().collect();
+    let message = self.rewrite_box(|layout| {
+      let removed = itembox::delete(layout, &selected);
+      Ok(format!("Deleted {removed} slots"))
+    })?;
+    self.box_selected.clear();
+    Ok(message)
+  }
+
+  fn box_set_quantity_selected(&mut self) -> Result<String, String> {
+    let quantity = self
+      .box_bulk_qty
+      .trim()
+      .parse::<u32>()
+      .map_err(|_| "Quantity must be a number".to_owned())?;
+    let selected: Vec<usize> = self.box_selected.iter().copied().collect();
+    self.rewrite_box(|layout| {
+      let changed = itembox::set_quantity(layout, &selected, quantity)?;
+      Ok(format!("Set quantity to {quantity} on {changed} slots"))
+    })
+  }
+
+  fn box_move_selected(&mut self) -> Result<String, String> {
+    let slot = self
+      .box_move_slot
+      .trim()
+      .parse::<usize>()
+      .map_err(|_| "Target slot must be a number".to_owned())?;
+    if slot == 0 {
+      return Err("Slots start at 1".to_owned());
+    }
+    let selected: Vec<usize> = self.box_selected.iter().copied().collect();
+    let mut landed = Vec::new();
+    let message = self.rewrite_box(|layout| {
+      landed = itembox::move_to(layout, &selected, slot - 1)?;
+      Ok(format!("Moved {} slots to start at slot {slot}", landed.len()))
+    })?;
+    self.box_selected = landed.into_iter().collect();
+    Ok(message)
+  }
+
+  fn box_sort_all(&mut self) -> Result<String, String> {
+    let key = SortKey::ALL[self.box_sort];
+    let message = self.rewrite_box(|layout| {
+      itembox::sort(layout, key);
+      Ok(format!("Item Box sorted by {}", key.label()))
+    })?;
+    self.box_selected.clear();
+    Ok(message)
+  }
+
+  /// Draws one item box row. Returns `Some(checked)` when the row's checkbox
+  /// was clicked this frame.
+  fn show_item_row(&mut self, ui: &mut egui::Ui, index: usize) -> Option<bool> {
+    let (id, num) = self.target.as_ref().map(|opened| opened.box_items[index])?;
     let muted = self.theme.palette().ink_muted;
-    ui.horizontal(|ui| {
-      ui.add_sized(
-        [52.0, 18.0],
-        egui::Label::new(egui::RichText::new(format!("{:04}", index + 1)).monospace().color(muted)),
-      );
-      if num == 0 {
-        ui.add_sized(
-          [240.0, 18.0],
-          egui::Label::new(egui::RichText::new("(empty slot)").italics().color(muted)),
-        );
-      } else {
-        let name = crate::items::item_display_name(id);
-        let response = ui
-          .allocate_ui_with_layout(
-            egui::vec2(240.0, 18.0),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| ui.add(egui::Label::new(egui::RichText::new(name).strong()).truncate()),
-          )
-          .inner;
-        if let Some(cn) = crate::items::item_name_cn(id) {
-          response.on_hover_text(cn);
+    let mut selected = self.box_selected.contains(&index);
+    let mut toggled = None;
+    let fill = if selected { ui.visuals().selection.bg_fill } else { egui::Color32::TRANSPARENT };
+    egui::Frame::new().fill(fill).corner_radius(egui::CornerRadius::same(3)).show(ui, |ui| {
+      ui.horizontal(|ui| {
+        let left = egui::Layout::left_to_right(egui::Align::Center);
+        let right = egui::Layout::right_to_left(egui::Align::Center);
+        if num > 0 {
+          if cell(ui, 24.0, left, |ui| ui.checkbox(&mut selected, "")).changed() {
+            toggled = Some(selected);
+          }
+        } else {
+          cell(ui, 24.0, left, |_| {});
         }
-      }
-      let category = crate::items::item_category(id).unwrap_or("-");
-      ui.add_sized([90.0, 18.0], egui::Label::new(egui::RichText::new(category).color(muted)).truncate());
-      ui.add_sized(
-        [84.0, 18.0],
-        egui::Label::new(egui::RichText::new(format!("{id:08x}")).monospace().color(muted)),
-      );
-      ui.add_sized(
-        [72.0, 18.0],
-        egui::Label::new(egui::RichText::new(num.to_string()).monospace()),
-      );
-      ui.add_sized([90.0, 18.0], egui::TextEdit::singleline(&mut self.box_edits[index]));
+        cell(ui, 52.0, left, |ui| {
+          ui.label(egui::RichText::new(format!("{:04}", index + 1)).monospace().color(muted))
+        });
+        if num == 0 {
+          cell(ui, 240.0, left, |ui| {
+            ui.label(egui::RichText::new("(empty slot)").italics().color(muted))
+          });
+        } else {
+          let name = crate::items::item_display_name(id);
+          let response = cell(ui, 240.0, left, |ui| {
+            ui.add(egui::Label::new(egui::RichText::new(name).strong()).truncate())
+          });
+          if let Some(cn) = crate::items::item_name_cn(id) {
+            response.on_hover_text(cn);
+          }
+        }
+        let category = crate::items::item_category(id).unwrap_or("-");
+        cell(ui, 90.0, left, |ui| {
+          ui.add(egui::Label::new(egui::RichText::new(category).color(muted)).truncate())
+        });
+        cell(ui, 84.0, left, |ui| {
+          ui.label(egui::RichText::new(format!("{id:08x}")).monospace().color(muted))
+        });
+        cell(ui, 72.0, right, |ui| ui.label(egui::RichText::new(num.to_string()).monospace()));
+        ui.add_sized([90.0, 18.0], egui::TextEdit::singleline(&mut self.box_edits[index]));
+      });
     });
+    toggled
   }
 
   fn show_equip_tab(&mut self, ui: &mut egui::Ui) {
@@ -1519,7 +1716,7 @@ impl GuiApp {
     ui.label("· To get a new save to a high rank: finish the unlock quests in game, or use Transfer to move gear / items / rank progress from a high-rank save (unlocks are still bound by quest progress)");
   }
 
-  /// Applies the three point-accumulator edits from the 进度与解禁 tab.
+  /// Applies the three point-accumulator edits from the Progress tab.
   fn apply_point_edits(&mut self) -> Result<String, String> {
     let parse = |text: &str, name: &str| -> Result<Option<u32>, String> {
       let trimmed = text.trim();
@@ -1590,7 +1787,7 @@ impl GuiApp {
     ))
   }
 
-  /// Applies guild card unlock flags from the 进度与解禁 tab.
+  /// Applies guild card unlock flags from the Progress tab.
   fn apply_guild_flags(&mut self, values: &[(u32, bool)]) -> Result<String, String> {
     let Some(opened) = self.target.as_mut() else {
       return Err("No target save is open".to_owned());

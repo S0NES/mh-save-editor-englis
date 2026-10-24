@@ -15,6 +15,7 @@ pub mod edit;
 pub mod format;
 pub mod game;
 pub mod gui;
+pub mod itembox;
 pub mod items;
 pub mod json;
 pub mod payload;

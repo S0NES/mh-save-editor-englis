@@ -47,10 +47,10 @@ def main() -> None:
         for file in sorted(stage.iterdir()):
             bundle.write(file, arcname=f"{stage.name}/{file.name}")
 
-    print(f"\n== 打包完成: {zip_path} ({zip_path.stat().st_size / 1048576:.1f} MiB) ==")
+    print(f"\n== Packaging done: {zip_path} ({zip_path.stat().st_size / 1048576:.1f} MiB) ==")
     for file in sorted(stage.iterdir()):
         print(f"  {file.name}  {file.stat().st_size / 1048576:.2f} MiB")
-    print("\n发布仅需此 zip;target/ 下的其余文件都是编译中间产物,无需分发。")
+    print("\nOnly this zip needs to be released; everything else under target/ is a build intermediate.")
 
 
 if __name__ == "__main__":

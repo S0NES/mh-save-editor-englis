@@ -54,7 +54,7 @@ pub fn item_name(id: u32) -> Option<&'static str> {
   internal_table().get(&id).copied()
 }
 
-/// The Chinese display name of an item (for example `回复药`), if the
+/// The Chinese display name of an item (the official Rise localization), if the
 /// community table knows it.
 pub fn item_name_cn(id: u32) -> Option<&'static str> {
   chinese_table().get(&id).map(|(name, _)| *name)
@@ -114,7 +114,7 @@ mod tests {
     assert_eq!(item_category(0x0410_0006), Some("Consume"));
     // The table only covers real in-game items; the None sentinel has none.
     assert_eq!(item_name_cn(0x0400_0000), None);
-    assert_eq!(item_category(0x0410_0007), Some("Consume")); // 回复药G
+    assert_eq!(item_category(0x0410_0007), Some("Consume")); // Mega Potion
     assert_eq!(item_name_cn(0xdead_beef), None);
   }
 

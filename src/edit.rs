@@ -84,14 +84,14 @@ pub const GUILD_FLAG_IS_SPECIAL_MYSTERY_UNLOCKED: u32 = 0x158c_02bf;
 /// (field hash, human label) of the guild card unlock flags, in display
 /// order for the GUI.
 pub const GUILD_FLAGS: [(u32, &str); 8] = [
-  (GUILD_FLAG_IS_MR_RELEASE, "大师等级解禁 (isMRRelease)"),
-  (GUILD_FLAG_IS_MR_DISP, "显示大师等级 (isMRDisp)"),
-  (GUILD_FLAG_IS_MYSTERY_QUEST_UNLOCKED, "怪异调查任务解锁"),
-  (GUILD_FLAG_IS_SPECIAL_MYSTERY_UNLOCKED, "特别怪异调查解锁"),
-  (GUILD_FLAG_IS_END_CONTENTS_UNLOCKED, "终盘内容解锁"),
-  (GUILD_FLAG_IS_SERVANT_QUEST_UNLOCKED, "随从任务解锁"),
-  (GUILD_FLAG_IS_OTOMO_SECRET_UNLOCKED, "随从秘密解锁"),
-  (GUILD_FLAG_IS_CUSTOM_WEAPON_EDIT_UNLOCKED, "自定义武器编辑解锁"),
+  (GUILD_FLAG_IS_MR_RELEASE, "Master Rank unlocked (isMRRelease)"),
+  (GUILD_FLAG_IS_MR_DISP, "Show Master Rank (isMRDisp)"),
+  (GUILD_FLAG_IS_MYSTERY_QUEST_UNLOCKED, "Anomaly Investigations unlocked"),
+  (GUILD_FLAG_IS_SPECIAL_MYSTERY_UNLOCKED, "Special Anomaly Investigations unlocked"),
+  (GUILD_FLAG_IS_END_CONTENTS_UNLOCKED, "Endgame content unlocked"),
+  (GUILD_FLAG_IS_SERVANT_QUEST_UNLOCKED, "Buddy quests unlocked"),
+  (GUILD_FLAG_IS_OTOMO_SECRET_UNLOCKED, "Buddy secrets unlocked"),
+  (GUILD_FLAG_IS_CUSTOM_WEAPON_EDIT_UNLOCKED, "Custom weapon editing unlocked"),
 ];
 
 /// Reads the self guild card's unlock flags as (hash, value) pairs. Buddy
@@ -1246,6 +1246,29 @@ pub fn set_item_counts(
   Ok(report)
 }
 
+/// Rewrites the whole item box from `layout`, one `(item id, count)` pair per
+/// slot in slot order. A zero count is written in the game's empty-slot form
+/// (the "none" id). The layout must have exactly as many slots as the box.
+pub fn write_item_box(payload: &mut SavePayload, layout: &[(u32, u32)]) -> Result<()> {
+  let slots = find_inventory_list(payload)?.values.len();
+  if layout.len() != slots {
+    bail!("item box layout has {} slots but the save has {slots}", layout.len());
+  }
+  let mut index = 0;
+  for_each_item_count_mut(payload, &mut |count| {
+    if let Some(&(id, num)) = layout.get(index) {
+      let id = if num == 0 { ITEM_ID_NONE } else { id };
+      write_count_field(count, ITEM_COUNT_ID, id);
+      write_count_field(count, ITEM_COUNT_NUM, num);
+    }
+    index += 1;
+  });
+  if index != slots {
+    bail!("wrote {index} item box slots but expected {slots}");
+  }
+  Ok(())
+}
+
 /// Walks every `snow.data.ItemCount` class inside the item box.
 fn for_each_item_count_mut(payload: &mut SavePayload, f: &mut dyn FnMut(&mut Class)) {
   for entry in &mut payload.entries {
@@ -1860,6 +1883,23 @@ mod tests {
     let error =
       set_item_counts(&mut payload, &[(0x0410_0200, 1)]).expect_err("no empty slot must fail");
     assert!(error.to_string().contains("full"), "unexpected error: {error}");
+  }
+
+  #[test]
+  fn write_item_box_rewrites_every_slot() {
+    let mut payload = box_payload(vec![
+      item_slot(0x0410_0006, 10),
+      item_slot(ITEM_ID_NONE, 0),
+      item_slot(0x0410_0007, 20),
+    ]);
+    write_item_box(&mut payload, &[(0x0410_0007, 20), (0x0410_0006, 0), (0x0410_0009, 3)])
+      .expect("write box");
+    let entries = read_item_box(&payload).expect("read box");
+    assert_eq!(entries[0], ItemBoxEntry { id: 0x0410_0007, num: 20 });
+    // A zero count is stored as the empty-slot id.
+    assert_eq!(entries[1], ItemBoxEntry { id: ITEM_ID_NONE, num: 0 });
+    assert_eq!(entries[2], ItemBoxEntry { id: 0x0410_0009, num: 3 });
+    write_item_box(&mut payload, &[(0x0410_0007, 1)]).expect_err("wrong slot count must fail");
   }
   fn loadout_element(name: &str, is_using: bool, indices: &[u32]) -> crate::payload::ArrayValue {
     use crate::payload::Array;
