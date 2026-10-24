@@ -15,3 +15,6 @@ smoke_*.json
 # release exes copied to the repo root
 /mhrise-save-editor.exe
 /mhrise-save-editor-gui.exe
+
+# Claude Code local state and worktrees
+/.claude/
