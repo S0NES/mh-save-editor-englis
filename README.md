@@ -1,9 +1,19 @@
-# MHRise Save Editor (Steam save editor for Monster Hunter Rise)
+# MH Save Editor
 
-A tool to view, edit and transfer Steam saves of *Monster Hunter Rise: Sunbreak*. It works on the three character saves in the `win64_save` folder (`data001Slot.bin` ~ `data003Slot.bin`). The GUI has a game selector so other PC Monster Hunter titles can be added later; for now only Rise is editable.
+A save editor for the Steam version of *Monster Hunter Rise: Sunbreak*. Open one of your character saves, change what you want (Zenny, points, ranks, the Item Box, loadouts) and write it back. No hex editing, no digging through folders: it finds your saves on its own and works out your SteamID64 from the save path.
+
+## Where this comes from
+
+This project is a fork of [ChevalGrand/mhrise-save-editor](https://github.com/ChevalGrand/mhrise-save-editor), and all the hard work of cracking the save format is theirs. Huge thanks to ChevalGrand. On top of that base I translated the whole UI and item names to English, added a game selector with logos, light and dark themes, bulk Item Box editing (with a `+5` / `-5` quantity calculator) and the loadout tools. The container and crypto code goes further back to [jinghaihan/mhrise-save-converter](https://github.com/jinghaihan/mhrise-save-converter), whose research builds on [kvasszn/ree-save-editor](https://github.com/kvasszn/ree-save-editor).
+
+## Download
+
+Grab the latest zip from the [Releases page](https://github.com/S0NES/MH-save-editor/releases), unzip it anywhere and run `mhrise-save-editor-gui.exe`. It is a single portable program, nothing to install.
+
+Monster Hunter Rise is the only game you can edit right now. World and Wilds show up in the selector so they can be added later, but their saves are not supported yet. The logos are Capcom trademarks, used only to label the games.
 
 > [!WARNING]
-> Back up your saves before editing (the Backup tab does it in one click, the CLI has a `backup` command) and keep the game closed. Every field mapping was verified against real saves (Zenny, points, Item Box, equipment, ranks, loadouts), but extreme edits can still go wrong. Try things on a throwaway slot first.
+> Back up your saves before editing (the Backup tab does it in one click, the CLI has a `backup` command) and keep the game closed. Every field mapping was checked against real saves (Zenny, points, Item Box, equipment, ranks, loadouts), but extreme edits can still go wrong. Try things on a throwaway slot first.
 
 ## How it works
 
@@ -12,7 +22,7 @@ A tool to view, edit and transfer Steam saves of *Monster Hunter Rise: Sunbreak*
 - Citrus: **the SteamID64 derives an ECC key, which decrypts the data blocks with AES-128-CBC**. Each block has a SHA3-256 hash, blocks are 0x40000 bytes, and there is a trailing 0x1000 block (may be zero).
 - The curve index is found by brute force over 128 preset curves, checking the decrypted block hash, so **you only need the SteamID64** (17 digits = 76561197960265728 + the 32-bit account ID; the account ID is the `userdata\<account ID>\` folder name, and the GUI works it out for you).
 - The outer checksum is MurmurHash3 (seed 0xffffffff) with a declared-length prefix.
-- The container and crypto code is ported from the MIT-licensed [jinghaihan/mhrise-save-converter](https://github.com/jinghaihan/mhrise-save-converter) (whose research builds on [kvasszn/ree-save-editor](https://github.com/kvasszn/ree-save-editor)). The rest of this repository is original.
+- The container and crypto code comes from the MIT-licensed [jinghaihan/mhrise-save-converter](https://github.com/jinghaihan/mhrise-save-converter), via ChevalGrand's editor.
 
 ### Class stream: RSZ structures and field hashes
 The decrypted data is an RE Engine RSZ class stream (`native_hash` + `class{hash, fields[]}`). **Key finding of this project: field/class hash = murmur3_32(field name, seed 0xffffffff)**, which matches the community RSZ dictionary (`assets/mhrise/rszmhrise.json`, 250,000 entries) with 99.98% coverage. Every edit locates its target by class hash AND field hash together, so a same-named field elsewhere is never touched.
