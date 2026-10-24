@@ -11,3 +11,7 @@ equip_s1.json
 rank_s*.json
 verify_s1.json
 smoke_*.json
+
+# release exes copied to the repo root
+/mhrise-save-editor.exe
+/mhrise-save-editor-gui.exe

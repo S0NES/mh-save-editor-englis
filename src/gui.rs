@@ -23,7 +23,7 @@ use crate::{
   edit,
   format::parse_header,
   game::Game,
-  itembox::{self, SortKey},
+  itembox::{self, QuantityOp, SortKey},
   theme::Theme,
 };
 
@@ -136,6 +136,8 @@ pub struct GuiApp {
   box_sort: usize,
   box_edits: Vec<String>,
   game: Game,
+  /// Game logo textures, uploaded on the first frame.
+  game_logos: Option<[egui::TextureHandle; 3]>,
   theme: Theme,
   busy: bool,
   busy_text: String,
@@ -403,10 +405,11 @@ impl GuiApp {
       if text.is_empty() {
         continue;
       }
-      if let Ok(new_value) = text.parse::<u32>()
-        && new_value != *num
-      {
-        changes.push((*id, new_value));
+      if let Ok(op) = QuantityOp::parse(text) {
+        let new_value = op.apply(*num);
+        if new_value != *num {
+          changes.push((*id, new_value));
+        }
       }
     }
     changes
@@ -833,7 +836,77 @@ impl eframe::App for GuiApp {
 // UI sections
 // ---------------------------------------------------------------------------
 
+/// Card size and corner radius of the game selector (design token `radius-lg`).
+const GAME_CARD_SIZE: egui::Vec2 = egui::vec2(150.0, 84.0);
+const GAME_CARD_RADIUS: u8 = 10;
+/// Logo cards stay dark in both themes: the World and Wilds lettering is
+/// white/silver and would vanish on the light theme.
+const GAME_CARD_BG: egui::Color32 = egui::Color32::from_rgb(0x16, 0x14, 0x11);
+
+fn load_game_logos(ctx: &egui::Context) -> [egui::TextureHandle; 3] {
+  Game::ALL.map(|game| {
+    let image = image::load_from_memory_with_format(game.logo_bytes(), image::ImageFormat::Png)
+      .expect("embedded logo is a valid PNG")
+      .into_rgba8();
+    let size = [image.width() as usize, image.height() as usize];
+    let color = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+    ctx.load_texture(format!("logo-{}", game.name()), color, egui::TextureOptions::LINEAR)
+  })
+}
+
 impl GuiApp {
+  fn show_game_selector(&mut self, ui: &mut egui::Ui) {
+    let logos = self.game_logos.get_or_insert_with(|| load_game_logos(ui.ctx())).clone();
+    let palette = self.theme.palette();
+    ui.horizontal(|ui| {
+      for (game, texture) in Game::ALL.into_iter().zip(logos.iter()) {
+        let (rect, response) = ui.allocate_exact_size(GAME_CARD_SIZE, egui::Sense::click());
+        let selected = self.game == game;
+        let radius = egui::CornerRadius::same(GAME_CARD_RADIUS);
+        let painter = ui.painter();
+        painter.rect_filled(rect, radius, GAME_CARD_BG);
+        let opacity = if game.supported() { 1.0 } else { 0.45 };
+        let tint = egui::Color32::WHITE.gamma_multiply(opacity);
+        // Logo on top, status line below, both inside the card.
+        let logo_area = egui::Rect::from_min_max(
+          rect.min + egui::vec2(8.0, 6.0),
+          egui::pos2(rect.max.x - 8.0, rect.max.y - 22.0),
+        );
+        let natural = texture.size_vec2();
+        let scale = (logo_area.width() / natural.x).min(logo_area.height() / natural.y);
+        let logo_rect = egui::Rect::from_center_size(logo_area.center(), natural * scale);
+        painter.image(
+          texture.id(),
+          logo_rect,
+          egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+          tint,
+        );
+        let status_color = if game.supported() { palette.success } else { egui::Color32::from_gray(0xb0) };
+        painter.text(
+          egui::pos2(rect.center().x, rect.max.y - 11.0),
+          egui::Align2::CENTER_CENTER,
+          game.status(),
+          egui::FontId::proportional(12.0),
+          status_color,
+        );
+        if selected {
+          painter.rect_stroke(rect, radius, egui::Stroke::new(2.0, palette.accent), egui::StrokeKind::Inside);
+        } else if response.hovered() {
+          painter.rect_stroke(
+            rect,
+            radius,
+            egui::Stroke::new(1.0, palette.accent.gamma_multiply(0.5)),
+            egui::StrokeKind::Inside,
+          );
+        }
+        let response = response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(game.name());
+        if response.clicked() {
+          self.game = game;
+        }
+      }
+    });
+  }
+
   fn show_top_bar(&mut self, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
       ui.heading("MH Save Editor");
@@ -844,15 +917,7 @@ impl GuiApp {
         }
       });
     });
-    ui.horizontal(|ui| {
-      ui.label("Game");
-      for game in Game::ALL {
-        let text = format!("{} · {}", game.name(), game.status());
-        if ui.selectable_label(self.game == game, text).clicked() {
-          self.game = game;
-        }
-      }
-    });
+    self.show_game_selector(ui);
     if !self.game.supported() {
       ui.colored_label(
         self.theme.palette().danger,
@@ -1121,55 +1186,58 @@ impl GuiApp {
     let danger = self.theme.palette().danger;
     let selected_count = self.box_selected.len();
     let actionable = !self.busy && selected_count > 0;
-    ui.horizontal(|ui| {
-      ui.label(format!("{selected_count} selected"));
-      if ui.button("Select all shown").clicked() {
-        let with_items: Vec<usize> =
-          rows.iter().copied().filter(|&index| self.box_slot_has_item(index)).collect();
-        self.box_selected.extend(with_items);
-      }
-      if ui.add_enabled(selected_count > 0, egui::Button::new("Clear selection")).clicked() {
-        self.box_selected.clear();
-        self.box_last_clicked = None;
-      }
-      ui.separator();
-      ui.label("Set quantity");
-      ui.add_sized(
-        [60.0, 20.0],
-        egui::TextEdit::singleline(&mut self.box_bulk_qty).hint_text("0-9999"),
-      );
-      if ui.add_enabled(actionable, egui::Button::new("Set")).clicked() {
-        let result = self.box_set_quantity_selected();
-        self.log_box_result(result);
-      }
-      let delete_label = egui::RichText::new("Delete selected").color(danger);
-      if ui.add_enabled(actionable, egui::Button::new(delete_label)).clicked() {
-        let result = self.box_delete_selected();
-        self.log_box_result(result);
-      }
-    });
-    ui.horizontal(|ui| {
-      ui.label("Move selection to slot");
-      ui.add_sized(
-        [60.0, 20.0],
-        egui::TextEdit::singleline(&mut self.box_move_slot).hint_text("1-1800"),
-      );
-      if ui.add_enabled(actionable, egui::Button::new("Move")).clicked() {
-        let result = self.box_move_selected();
-        self.log_box_result(result);
-      }
-      ui.separator();
-      ui.label("Sort box by");
-      let current = SortKey::ALL[self.box_sort].label();
-      egui::ComboBox::from_id_salt("box-sort").selected_text(current).show_ui(ui, |ui| {
-        for (i, key) in SortKey::ALL.iter().enumerate() {
-          ui.selectable_value(&mut self.box_sort, i, key.label());
+    ui.label(egui::RichText::new("Edit selected").strong());
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+      ui.horizontal(|ui| {
+        ui.label(format!("{selected_count} selected"));
+        if ui.button("Select all shown").clicked() {
+          let with_items: Vec<usize> =
+            rows.iter().copied().filter(|&index| self.box_slot_has_item(index)).collect();
+          self.box_selected.extend(with_items);
+        }
+        if ui.add_enabled(selected_count > 0, egui::Button::new("Clear selection")).clicked() {
+          self.box_selected.clear();
+          self.box_last_clicked = None;
+        }
+        ui.separator();
+        ui.label("Quantity");
+        ui.add_sized(
+          [80.0, 20.0],
+          egui::TextEdit::singleline(&mut self.box_bulk_qty).hint_text("5, +5 or -5"),
+        );
+        if ui.add_enabled(actionable, egui::Button::new("Apply")).clicked() {
+          let result = self.box_set_quantity_selected();
+          self.log_box_result(result);
+        }
+        let delete_label = egui::RichText::new("Delete selected").color(danger);
+        if ui.add_enabled(actionable, egui::Button::new(delete_label)).clicked() {
+          let result = self.box_delete_selected();
+          self.log_box_result(result);
         }
       });
-      if ui.add_enabled(!self.busy, egui::Button::new("Sort (empty slots go last)")).clicked() {
-        let result = self.box_sort_all();
-        self.log_box_result(result);
-      }
+      ui.horizontal(|ui| {
+        ui.label("Move selection to slot");
+        ui.add_sized(
+          [60.0, 20.0],
+          egui::TextEdit::singleline(&mut self.box_move_slot).hint_text("1-1800"),
+        );
+        if ui.add_enabled(actionable, egui::Button::new("Move")).clicked() {
+          let result = self.box_move_selected();
+          self.log_box_result(result);
+        }
+        ui.separator();
+        ui.label("Sort box by");
+        let current = SortKey::ALL[self.box_sort].label();
+        egui::ComboBox::from_id_salt("box-sort").selected_text(current).show_ui(ui, |ui| {
+          for (i, key) in SortKey::ALL.iter().enumerate() {
+            ui.selectable_value(&mut self.box_sort, i, key.label());
+          }
+        });
+        if ui.add_enabled(!self.busy, egui::Button::new("Sort (empty slots go last)")).clicked() {
+          let result = self.box_sort_all();
+          self.log_box_result(result);
+        }
+      });
     });
     ui.horizontal(|ui| {
       let left = egui::Layout::left_to_right(egui::Align::Center);
@@ -1212,7 +1280,7 @@ impl GuiApp {
     );
     ui.label(format!(
       "Showing {} of {} slots. Tick rows (shift-click for a range) to edit many at once. \
-       Per row: leave New qty blank = no change, 0 = clear the item.",
+       Per row, New qty accepts 5 (set), +5 (add) or -5 (subtract); blank = no change, 0 = clear the item.",
       rows.len(),
       self.box_items_len()
     ));
@@ -1264,15 +1332,16 @@ impl GuiApp {
   }
 
   fn box_set_quantity_selected(&mut self) -> Result<String, String> {
-    let quantity = self
-      .box_bulk_qty
-      .trim()
-      .parse::<u32>()
-      .map_err(|_| "Quantity must be a number".to_owned())?;
+    let op = QuantityOp::parse(&self.box_bulk_qty)?;
     let selected: Vec<usize> = self.box_selected.iter().copied().collect();
     self.rewrite_box(|layout| {
-      let changed = itembox::set_quantity(layout, &selected, quantity)?;
-      Ok(format!("Set quantity to {quantity} on {changed} slots"))
+      let changed = itembox::apply_quantity(layout, &selected, op);
+      let what = match op {
+        QuantityOp::Set(value) => format!("Set quantity to {value}"),
+        QuantityOp::Add(value) => format!("Added {value} to the quantity"),
+        QuantityOp::Subtract(value) => format!("Subtracted {value} from the quantity"),
+      };
+      Ok(format!("{what} on {changed} slots"))
     })
   }
 

@@ -1881,6 +1881,7 @@ dependencies = [
  "clap",
  "eframe",
  "hex-literal",
+ "image",
  "murmur3",
  "num-bigint",
  "num-integer",

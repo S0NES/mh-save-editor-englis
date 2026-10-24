@@ -37,14 +37,15 @@ Item names: `assets/mhrise/item_names_cn.json` (1771 entries) comes from the com
 ## Features
 
 ### GUI (`mhrise-save-editor-gui`)
-- **Game selector and file selector:** pick the game, then choose a save from the auto-detected list or browse for a file. Only Monster Hunter Rise is editable today; World and Wilds are listed as not supported yet.
+- **Game selector with logos:** clickable logo cards for Rise, World and Wilds sit at the top (the selected card gets an accent outline). The logos are Capcom trademarks, used only to label the games.
+- **File selector:** choose a save from the auto-detected list or browse for a file. Only Monster Hunter Rise is editable today; World and Wilds are listed as not supported yet.
 - **Dark and light themes** (toggle in the top right).
 - **Auto-detect saves:** reads the registry and the Steam library config to find every `userdata\<account>\1446780\remote\win64_save`; Quick select fills in the SteamID64.
 - **General:** hunter name, ranks (HR / MR / Anomaly Research), Zenny and points, container info.
 - **Player:** edit Zenny, lifetime Zenny, points and the three ranks (applied in memory, written on save).
 - **Item Box:** all 1800 slots with English names (the Chinese name shows on hover and is searchable), category filter, search by name / category / ID, and per-row quantity edits. Bulk tools:
   - tick rows with the checkboxes (shift-click selects a range, "Select all shown" ticks every item in the current filter);
-  - **Set quantity** on the selection (0-9999; 0 empties the slot);
+  - **Quantity calculator** on the selection: `5` sets the quantity, `+5` adds (max 9999), `-5` subtracts (stops at 0, which empties the slot). The per-row "New qty" boxes take the same syntax;
   - **Delete selected**;
   - **Move selection to slot N**, which keeps the selection's order and swaps the slots it lands on into the places it left, so nothing is lost;
   - **Sort the whole box** by name, category, ID or quantity; empty slots move to the end.
