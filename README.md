@@ -1,6 +1,8 @@
-# MH Save Editor
+# MH Save Editor: Monster Hunter Rise & World Save Editor
 
-A save editor for the Steam version of *Monster Hunter Rise: Sunbreak*. Open one of your character saves, change what you want (Zenny, points, ranks, the Item Box, loadouts) and write it back. No hex editing, no digging through folders: it finds your saves on its own and works out your SteamID64 from the save path.
+A free, portable save editor for the Steam versions of **Monster Hunter Rise: Sunbreak** and **Monster Hunter: World (Iceborne)**. Open one of your character saves, change Zenny, research points, hunter and master ranks, the Item Box, loadouts and more, then write it back. No hex editing, no digging through folders: it finds your Rise saves on its own, works out your SteamID64 from the save path, and has an English and Chinese interface.
+
+Keywords: Monster Hunter Rise save editor, Monster Hunter World save editor, MH World Iceborne save editor, Monster Hunter Sunbreak save editor, MHR save editor, Zenny editor, Steam save editor, Monster Hunter save editing tool.
 
 ## Where this comes from
 
@@ -8,7 +10,7 @@ This project is a fork of [ChevalGrand/mhrise-save-editor](https://github.com/Ch
 
 ## Download
 
-Grab the latest zip from the [Releases page](https://github.com/S0NES/MH-save-editor/releases), unzip it anywhere and run `mhrise-save-editor-gui.exe`. It is a single portable program, nothing to install.
+Grab the latest zip from the [Releases page](https://github.com/S0NES/mh-save-editor-englis/releases), unzip it anywhere and run `mhrise-save-editor-gui.exe`. It is a single portable program, nothing to install.
 
 Monster Hunter Rise and Monster Hunter: World (Iceborne, Steam) can be edited. Wilds shows up in the selector but its saves are not supported yet. World support covers the three character slots: name, zenny, research points, and HR / MR rank and experience. The logos are Capcom trademarks, used only to label the games.
 

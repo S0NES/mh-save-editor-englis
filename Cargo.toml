@@ -1,12 +1,12 @@
 [package]
 name = "mhrise-save-editor"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
-description = "A Steam-only Monster Hunter Rise save editor: inspect, dump, edit, and repack win64 saves."
+description = "Free Steam save editor for Monster Hunter Rise: Sunbreak and Monster Hunter: World (Iceborne): edit Zenny, ranks, research points, Item Box and loadouts."
 license = "MIT"
 readme = "README.md"
-keywords = ["monster-hunter-rise", "save-editor", "steam"]
+keywords = ["monster-hunter-rise", "monster-hunter-world", "iceborne", "save-editor", "steam"]
 categories = ["command-line-utilities"]
 default-run = "mhrise-save-editor"
 
