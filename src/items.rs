@@ -13,6 +13,8 @@ use std::{
   sync::OnceLock,
 };
 
+use crate::language::Language;
+
 const ITEM_NAMES_JSON: &str = include_str!("../assets/mhrise/item_names.json");
 const ITEM_NAMES_CN_JSON: &str = include_str!("../assets/mhrise/item_names_cn.json");
 const ITEM_NAMES_EN_JSON: &str = include_str!("../assets/mhrise/item_names_en.json");
@@ -87,14 +89,23 @@ pub fn item_name_en(id: u32) -> Option<&'static str> {
   english_table().get(&id).copied()
 }
 
-/// Best-effort display name: English name if known, else the Chinese name,
-/// else the internal identifier, else the raw id in hex.
-pub fn item_display_name(id: u32) -> String {
-  item_name_en(id)
-    .or_else(|| item_name_cn(id))
+/// Best-effort display name in `language`: that language's name if known, else
+/// the other language's, else the internal identifier, else the raw id in hex.
+pub fn item_display_name_in(id: u32, language: Language) -> String {
+  let (preferred, other) = match language {
+    Language::English => (item_name_en(id), item_name_cn(id)),
+    Language::Chinese => (item_name_cn(id), item_name_en(id)),
+  };
+  preferred
+    .or(other)
     .or_else(|| item_name(id))
     .map(str::to_owned)
     .unwrap_or_else(|| format!("0x{id:08X}"))
+}
+
+/// Display name in English; see [`item_display_name_in`].
+pub fn item_display_name(id: u32) -> String {
+  item_display_name_in(id, Language::English)
 }
 
 #[cfg(test)]
@@ -121,6 +132,7 @@ mod tests {
   #[test]
   fn display_name_prefers_chinese_then_internal_then_hex() {
     assert_eq!(item_display_name(0x0410_0006), "Potion");
+    assert_eq!(item_display_name_in(0x0410_0006, Language::Chinese), "回复药");
     assert_eq!(item_name_en(0x0410_0006), Some("Potion"));
     assert_eq!(item_display_name(0x0400_0000), "I_Unclassified_None");
     assert_eq!(item_display_name(0xdead_beef), "0xDEADBEEF");

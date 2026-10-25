@@ -22,7 +22,7 @@ impl Game {
 
   /// Whether the editor can read and write this game's saves.
   pub fn supported(self) -> bool {
-    matches!(self, Game::Rise)
+    matches!(self, Game::Rise | Game::World)
   }
 
   /// One-line status shown under the game name in the selector.

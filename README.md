@@ -10,7 +10,7 @@ This project is a fork of [ChevalGrand/mhrise-save-editor](https://github.com/Ch
 
 Grab the latest zip from the [Releases page](https://github.com/S0NES/MH-save-editor/releases), unzip it anywhere and run `mhrise-save-editor-gui.exe`. It is a single portable program, nothing to install.
 
-Monster Hunter Rise is the only game you can edit right now. World and Wilds show up in the selector so they can be added later, but their saves are not supported yet. The logos are Capcom trademarks, used only to label the games.
+Monster Hunter Rise and Monster Hunter: World (Iceborne, Steam) can be edited. Wilds shows up in the selector but its saves are not supported yet. World support covers the three character slots: name, zenny, research points, and HR / MR rank and experience. The logos are Capcom trademarks, used only to label the games.
 
 > [!WARNING]
 > Back up your saves before editing (the Backup tab does it in one click, the CLI has a `backup` command) and keep the game closed. Every field mapping was checked against real saves (Zenny, points, Item Box, equipment, ranks, loadouts), but extreme edits can still go wrong. Try things on a throwaway slot first.
@@ -50,6 +50,7 @@ Item names: `assets/mhrise/item_names_cn.json` (1771 entries) comes from the com
 - **Game selector with logos:** clickable logo cards for Rise, World and Wilds sit at the top (the selected card gets an accent outline). The logos are Capcom trademarks, used only to label the games.
 - **File selector:** choose a save from the auto-detected list or browse for a file. Only Monster Hunter Rise is editable today; World and Wilds are listed as not supported yet.
 - **Dark and light themes** (toggle in the top right).
+- **Language selector** (top right): switches the interface and item names between English (default) and Chinese (中文). Item names also show the other language on hover, and search matches both.
 - **Auto-detect saves:** reads the registry and the Steam library config to find every `userdata\<account>\1446780\remote\win64_save`; Quick select fills in the SteamID64.
 - **General:** hunter name, ranks (HR / MR / Anomaly Research), Zenny and points, container info.
 - **Player:** edit Zenny, lifetime Zenny, points and the three ranks (applied in memory, written on save).
