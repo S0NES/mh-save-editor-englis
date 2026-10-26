@@ -48,6 +48,32 @@ impl Game {
       Game::Wilds => 2_246_340,
     }
   }
+
+  /// Path of the save folder below `userdata\<account>\<app id>\`.
+  pub fn save_subdir(self) -> &'static [&'static str] {
+    match self {
+      Game::World => &["remote"],
+      _ => &["remote", "win64_save"],
+    }
+  }
+
+  /// Save file names looked for inside the save folder (Quick select).
+  pub fn slot_files(self) -> &'static [&'static str] {
+    match self {
+      Game::Rise => &["data001Slot.bin", "data002Slot.bin", "data003Slot.bin"],
+      Game::World => &["SAVEDATA1000"],
+      Game::Wilds => &[],
+    }
+  }
+
+  /// Extension filter for the Browse dialog; `None` shows every file
+  /// (World's `SAVEDATA1000` has no extension).
+  pub fn file_extensions(self) -> Option<&'static [&'static str]> {
+    match self {
+      Game::World => None,
+      _ => Some(&["bin"]),
+    }
+  }
 }
 
 #[cfg(test)]

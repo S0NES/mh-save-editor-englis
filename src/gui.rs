@@ -417,19 +417,30 @@ impl GuiApp {
       ..Self::default()
     };
     app.log_line(&font_status);
-    app.discovered = discover_steam_slot_files();
-    if let Some((_, _, Some(account))) = app.discovered.first() {
-      app.steamid64 = steamid64_from_account(*account).to_string();
+    app.refresh_discovered();
+    app
+  }
+
+  /// Re-scans Steam for the selected game's saves and drops paths that
+  /// belonged to the previously selected game.
+  fn refresh_discovered(&mut self) {
+    self.discovered = discover_steam_slot_files(self.game);
+    self.target_path.clear();
+    self.source_path.clear();
+    if let Some((_, _, Some(account))) = self.discovered.first() {
+      self.steamid64 = steamid64_from_account(*account).to_string();
     }
-    if app.discovered.is_empty() {
-      app.log_line("Auto-detect: no MH Rise save folder found on this PC. Browse for a save file (see the Help tab).");
+    if self.discovered.is_empty() {
+      self.log_line(&format!(
+        "Auto-detect: no {} save folder found on this PC. Browse for a save file (see the Help tab).",
+        self.game.name()
+      ));
     } else {
-      app.log_line(&format!(
+      self.log_line(&format!(
         "Auto-detect: found {} character saves; pick one in Quick select",
-        app.discovered.len()
+        self.discovered.len()
       ));
     }
-    app
   }
 
   /// Re-reads ranks/points/flag inputs from the opened document.
@@ -1122,8 +1133,9 @@ impl GuiApp {
           );
         }
         let response = response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(game.name());
-        if response.clicked() {
+        if response.clicked() && self.game != game {
           self.game = game;
+          self.refresh_discovered();
         }
       }
     });
@@ -1190,10 +1202,7 @@ impl GuiApp {
       ui.label(tr(self.language, "Target save"));
       ui.add_sized([420.0, 20.0], egui::TextEdit::singleline(&mut self.target_path));
       if ui.add_enabled(!self.busy, egui::Button::new(tr(self.language, "Browse…"))).clicked()
-        && let Some(path) = rfd::FileDialog::new()
-          .add_filter(tr(self.language, "MH Rise save"), &["bin"])
-          .set_title(tr(self.language, "Choose target save"))
-          .pick_file()
+        && let Some(path) = save_dialog(self.game, self.language, "Choose target save").pick_file()
       {
         self.target_path = path.display().to_string();
       }
@@ -1891,10 +1900,7 @@ impl GuiApp {
       ui.label(tr(self.language, "Source save"));
       ui.add_sized([420.0, 20.0], egui::TextEdit::singleline(&mut self.source_path));
       if ui.add_enabled(!self.busy, egui::Button::new(tr(self.language, "Browse…"))).clicked()
-        && let Some(path) = rfd::FileDialog::new()
-          .add_filter(tr(self.language, "MH Rise save"), &["bin"])
-          .set_title(tr(self.language, "Choose source save"))
-          .pick_file()
+        && let Some(path) = save_dialog(self.game, self.language, "Choose source save").pick_file()
       {
         self.source_path = path.display().to_string();
       }
@@ -2313,9 +2319,18 @@ fn path_key(path: &Path) -> String {
   text.trim_end_matches('\\').to_lowercase()
 }
 
-/// Scans every known Steam library for MHR save directories
-/// (`userdata/<account>/1446780/remote/win64_save`).
-fn discover_save_dirs() -> Vec<PathBuf> {
+/// File dialog for a save of `game`; the extension filter follows the game.
+fn save_dialog(game: Game, language: Language, title: &'static str) -> rfd::FileDialog {
+  let dialog = rfd::FileDialog::new().set_title(tr(language, title));
+  match game.file_extensions() {
+    Some(extensions) => dialog.add_filter(tr(language, "MH Rise save"), extensions),
+    None => dialog,
+  }
+}
+
+/// Scans every known Steam library for the game's save directories
+/// (`userdata/<account>/<app id>/...`, see `Game::save_subdir`).
+fn discover_save_dirs(game: Game) -> Vec<PathBuf> {
   let mut roots: Vec<PathBuf> = Vec::new();
   if let Ok(output) = std::process::Command::new("reg")
     .args(["query", r"HKCU\Software\Valve\Steam", "/v", "SteamPath"])
@@ -2369,7 +2384,8 @@ fn discover_save_dirs() -> Vec<PathBuf> {
       continue;
     };
     for account in accounts.flatten() {
-      let dir = account.path().join("1446780").join("remote").join("win64_save");
+      let mut dir = account.path().join(game.steam_app_id().to_string());
+      dir.extend(game.save_subdir());
       if dir.is_dir() {
         saves.push(dir);
       }
@@ -2381,22 +2397,20 @@ fn discover_save_dirs() -> Vec<PathBuf> {
 }
 
 /// Lists the character slot files inside every discovered save directory.
-fn discover_steam_slot_files() -> Vec<(PathBuf, String, Option<u32>)> {
+fn discover_steam_slot_files(game: Game) -> Vec<(PathBuf, String, Option<u32>)> {
   let mut files = Vec::new();
   let mut seen = std::collections::BTreeSet::new();
-  for dir in discover_save_dirs() {
-    for name in ["data001Slot.bin", "data002Slot.bin", "data003Slot.bin"] {
+  for dir in discover_save_dirs(game) {
+    for name in game.slot_files() {
       let path = dir.join(name);
       let key = path_key(&path);
       if path.is_file() && seen.insert(key) {
-        let account = dir
-          .parent()
-          .and_then(|remote| remote.parent())
-          .and_then(|appid| appid.parent())
-          .and_then(|account| account.file_name())
-          .map(|name| name.to_string_lossy().to_string())
-          .unwrap_or_default();
-        files.push((path, format!("Account {account} / {name}"), account.parse::<u32>().ok()));
+        let account = account_id_from_path(&path);
+        let label = match account {
+          Some(account) => format!("Account {account} / {name}"),
+          None => format!("Account / {name}"),
+        };
+        files.push((path, label, account));
       }
     }
   }
