@@ -89,6 +89,13 @@ pub fn item_name_en(id: u32) -> Option<&'static str> {
   english_table().get(&id).copied()
 }
 
+/// Parses every name table now, so later lookups do not pay for it.
+pub fn warm() {
+  let _ = internal_table();
+  let _ = chinese_table();
+  let _ = english_table();
+}
+
 /// Best-effort display name in `language`: that language's name if known, else
 /// the other language's, else the internal identifier, else the raw id in hex.
 pub fn item_display_name_in(id: u32, language: Language) -> String {

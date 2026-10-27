@@ -19,12 +19,18 @@ use eframe::egui;
 use egui::Grid;
 
 use crate::{
+  codec,
   container::SteamSave,
   edit,
   format::parse_header,
   game::Game,
+  json,
   i18n::{fill, tr},
-  mhw::save::{Hunter, MhwSave, SLOT_COUNT},
+  itemtiles::{self, Area, Item, ItemModel},
+  mhw::{
+    itemview::WorldSlotItems,
+    save::{Hunter, MAX_ITEM_AMOUNT, MhwSave, SLOT_COUNT},
+  },
   itembox::{self, QuantityOp, SortKey},
   language::Language,
   theme::Theme,
@@ -38,6 +44,45 @@ const TAB_TRANSFER: usize = 4;
 const TAB_PROGRESS: usize = 5;
 const TAB_BACKUP: usize = 6;
 const TAB_HELP: usize = 7;
+/// The generic save explorer, shared by every game.
+const TAB_EXPLORER: usize = 8;
+
+/// World's own tabs. They share ids with the Rise tabs above, which is fine
+/// because each game only ever shows its own list.
+const MHW_TAB_CHARACTERS: usize = 0;
+const MHW_TAB_ITEMS: usize = 1;
+
+/// The tabs a game shows, as (tab id, label). The window draws the same tab
+/// bar for every game; only this list and the content behind each tab differ.
+fn sections(game: Game) -> &'static [(usize, &'static str)] {
+  match game {
+    Game::World => &[
+      (MHW_TAB_CHARACTERS, "Characters"),
+      (MHW_TAB_ITEMS, "Items"),
+      (TAB_EXPLORER, "Explorer"),
+      (TAB_HELP, "Help"),
+    ],
+    _ => &[
+      (TAB_INFO, "General"),
+      (TAB_PLAYER, "Player"),
+      (TAB_ITEMBOX, "Item Box"),
+      (TAB_EQUIP, "Loadouts"),
+      (TAB_TRANSFER, "Transfer"),
+      (TAB_PROGRESS, "Progress"),
+      (TAB_BACKUP, "Backup"),
+      (TAB_EXPLORER, "Explorer"),
+      (TAB_HELP, "Help"),
+    ],
+  }
+}
+
+/// The explorer's tree for one open save, kept until the save changes or the
+/// user asks to refresh it.
+struct ExplorerCache {
+  game: Game,
+  source: String,
+  root: codec::Node,
+}
 
 /// Loads a single-face CJK .ttf font. egui's text rasterizer (ab_glyph) does
 /// NOT support .ttc collections, which is why msyh.ttc/simsun.ttc cannot be
@@ -83,7 +128,16 @@ struct MhwOpened {
   path: PathBuf,
   save: MhwSave,
   slots: Vec<MhwSlotInputs>,
+  /// The character the panel is editing.
+  selected: usize,
   dirty: bool,
+  /// The World item area shown, as an index into `ItemArea::ALL`.
+  item_area: usize,
+  /// Search text for the item tiles.
+  item_filter: String,
+  /// The "Add item" row: item id and amount.
+  add_id: u32,
+  add_amount: u32,
 }
 
 /// Text shown for one World character slot, so values being typed are kept
@@ -140,20 +194,111 @@ fn write_mhw_in_place(path: &Path, save: &MhwSave) -> anyhow::Result<PathBuf> {
   Ok(backup)
 }
 
-fn mhw_field(ui: &mut egui::Ui, label: &str, value: &mut String) {
+/// One grid row, a label and a wide text box, for the World character panel.
+fn mhw_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
   ui.label(label);
-  ui.add(egui::TextEdit::singleline(value).desired_width(200.0));
+  ui.add(egui::TextEdit::singleline(value).desired_width(240.0));
   ui.end_row();
 }
 
+/// Draws the selected character's item areas as tile boxes, then the "Add item"
+/// row. Returns the first failed edit, if any.
+fn show_mhw_items(
+  ui: &mut egui::Ui,
+  opened: &mut MhwOpened,
+  slot: usize,
+  language: Language,
+  icons: &mut itemtiles::IconCache,
+) -> Option<String> {
+  let mut model = WorldSlotItems { save: &mut opened.save, slot, language };
+  let areas = model.areas();
+  let current = opened.item_area.min(areas.len() - 1);
+  opened.item_area = current;
+
+  ui.horizontal_wrapped(|ui| {
+    for (index, area) in areas.iter().enumerate() {
+      let entries = model.entries(index);
+      let filled = entries.iter().filter(|item| !item.is_empty()).count();
+      let label = fill(tr(language, "{} {}/{}"), &[&area.label, &filled, &entries.len()]);
+      ui.selectable_value(&mut opened.item_area, index, label);
+    }
+  });
+  ui.add(egui::TextEdit::singleline(&mut opened.item_filter).hint_text(tr(language, "Search")).desired_width(240.0));
+
+  let filter = opened.item_filter.trim().to_lowercase();
+  let include = move |item: Item| {
+    filter.is_empty()
+      || crate::mhw::items::item_name(item.id).is_some_and(|name| name.to_lowercase().contains(&filter))
+      || item.id.to_string().contains(&filter)
+  };
+  let view = itemtiles::View { language, show_empty: true, include: &include, selected: None, area: Some(current) };
+  let actions = itemtiles::show(ui, &model, icons, &view);
+
+  let mut failure = None;
+  for action in actions {
+    if let itemtiles::Action::Set { area, index, item } = action {
+      match model.set_entry(area, index, item) {
+        Ok(()) => opened.dirty = true,
+        Err(error) => failure = Some(error),
+      }
+    }
+  }
+
+  ui.separator();
+  ui.horizontal(|ui| {
+    ui.label(tr(language, "ID"));
+    ui.add(egui::DragValue::new(&mut opened.add_id).range(1..=9_999));
+    ui.label(model.name(opened.add_id));
+    ui.label(tr(language, "Qty"));
+    ui.add(egui::DragValue::new(&mut opened.add_amount).range(1..=MAX_ITEM_AMOUNT));
+    if ui.button(tr(language, "Add")).clicked() {
+      let free = model.entries(current).iter().position(|item| item.is_empty());
+      match free {
+        Some(index) => {
+          let item = Item { id: opened.add_id, amount: opened.add_amount };
+          match model.set_entry(current, index, item) {
+            Ok(()) => opened.dirty = true,
+            Err(error) => failure = Some(error),
+          }
+        }
+        None => failure = Some(fill(tr(language, "{} is full"), &[&areas[current].label])),
+      }
+    }
+  });
+  failure
+}
+
 impl GuiApp {
+  /// Opens `target_path` at once, the way picking a quick save or Browse does.
+  fn open_target(&mut self, context: &egui::Context) {
+    if self.busy || !self.game.supported() || self.target_path.trim().is_empty() {
+      return;
+    }
+    if self.game == Game::World {
+      self.request_mhw_open();
+      return;
+    }
+    let Ok(steamid64) = self.parsed_steamid64() else {
+      self.log_line(tr(self.language, "✘ SteamID64 must be a number"));
+      return;
+    };
+    if self.dirty && !self.reopen_clicked_once {
+      self.reopen_clicked_once = true;
+      self.log_line(tr(self.language, "! Unsaved changes: choose the save again to discard them and reopen"));
+      return;
+    }
+    self.reopen_clicked_once = false;
+    let task = WorkerTask::Open { path: PathBuf::from(self.target_path.trim()), steamid64, is_source: false };
+    self.spawn(context, task);
+  }
+
   /// Opens the World save at the target path. Unsaved World edits need a
   /// second click, as Rise saves do.
   fn request_mhw_open(&mut self) {
     let unsaved = self.mhw.as_ref().is_some_and(|opened| opened.dirty);
     if unsaved && !self.reopen_clicked_once {
       self.reopen_clicked_once = true;
-      self.log_line(tr(self.language, "! Unsaved changes: click Open save again to discard them and reopen"));
+      self.log_line(tr(self.language, "! Unsaved changes: choose the save again to discard them and reopen"));
       return;
     }
     self.reopen_clicked_once = false;
@@ -167,7 +312,17 @@ impl GuiApp {
           .collect();
         self.status_error = None;
         self.log_line(&fill(tr(self.language, "✔ Opened {}"), &[&path.display()]));
-        self.mhw = Some(MhwOpened { path, save, slots, dirty: false });
+        self.mhw = Some(MhwOpened {
+          path,
+          save,
+          slots,
+          selected: 0,
+          dirty: false,
+          item_area: 0,
+          item_filter: String::new(),
+          add_id: 1,
+          add_amount: 1,
+        });
       }
       Err(error) => {
         let text = format!("{error:?}");
@@ -221,38 +376,62 @@ impl GuiApp {
 
   fn show_mhw_panel(&mut self, ui: &mut egui::Ui) {
     let language = self.language;
+    let section = self.tab;
+    let icons = &mut self.item_icons;
     let Some(opened) = self.mhw.as_mut() else {
       ui.label(tr(
         language,
-        "Browse to a SAVEDATA1000 file (Steam: userdata\\<account>\\582010\\remote) and click Open save.",
+        "Pick a SAVEDATA1000 file with Quick select or Browse (Steam: userdata\\<account>\\582010\\remote).",
       ));
       return;
     };
-    ui.label(fill(tr(language, "File: {}"), &[&opened.path.display()]));
-    ui.label(fill(tr(language, "SteamID64 in save header: {}"), &[&opened.save.steam_id()]));
-    if opened.dirty {
-      ui.label(tr(language, "● Unsaved changes (in memory)"));
-    }
+    ui.horizontal(|ui| {
+      for (index, inputs) in opened.slots.iter().enumerate() {
+        let label = fill(tr(language, "{} {}"), &[&(index + 1), &inputs.name]);
+        ui.selectable_value(&mut opened.selected, index, label);
+      }
+      if opened.dirty {
+        ui.label(tr(language, "● Unsaved"));
+      }
+    });
+
+    ui.separator();
 
     let mut apply = None;
-    for (index, inputs) in opened.slots.iter_mut().enumerate() {
-      ui.separator();
-      ui.strong(fill(tr(language, "Character slot {}"), &[&(index + 1)]));
-      Grid::new(("mhw-slot", index)).num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-        mhw_field(ui, tr(language, "Hunter name"), &mut inputs.name);
-        mhw_field(ui, tr(language, "Hunter rank (HR)"), &mut inputs.hunter_rank);
-        mhw_field(ui, tr(language, "HR experience"), &mut inputs.hunter_rank_xp);
-        mhw_field(ui, tr(language, "Master rank (MR)"), &mut inputs.master_rank);
-        mhw_field(ui, tr(language, "MR experience"), &mut inputs.master_rank_xp);
-        mhw_field(ui, tr(language, "Zenny"), &mut inputs.zeni);
-        mhw_field(ui, tr(language, "Research points"), &mut inputs.research_points);
+    let index = opened.selected.min(opened.slots.len().saturating_sub(1));
+    if section == MHW_TAB_CHARACTERS
+      && let Some(inputs) = opened.slots.get_mut(index)
+    {
+      ui.columns(2, |cols| {
+        Grid::new(("mhw-hunter", index)).num_columns(2).spacing([12.0, 6.0]).show(&mut cols[0], |ui| {
+          mhw_row(ui, tr(language, "Name"), &mut inputs.name);
+          mhw_row(ui, tr(language, "HR"), &mut inputs.hunter_rank);
+          mhw_row(ui, tr(language, "HR XP"), &mut inputs.hunter_rank_xp);
+          mhw_row(ui, tr(language, "MR"), &mut inputs.master_rank);
+          mhw_row(ui, tr(language, "MR XP"), &mut inputs.master_rank_xp);
+        });
+        Grid::new(("mhw-money", index)).num_columns(2).spacing([12.0, 6.0]).show(&mut cols[1], |ui| {
+          mhw_row(ui, tr(language, "Zenny"), &mut inputs.zeni);
+          mhw_row(ui, tr(language, "Research"), &mut inputs.research_points);
+        });
       });
-      if ui.button(fill(tr(language, "Apply slot {}"), &[&(index + 1)])).clicked() {
-        apply = Some(index);
-      }
+      ui.horizontal(|ui| {
+        if ui.button(tr(language, "Apply")).clicked() {
+          apply = Some(index);
+        }
+        ui.weak(fill(tr(language, "SteamID64 {}"), &[&opened.save.steam_id()]));
+      });
     }
+    let item_error = if section == MHW_TAB_ITEMS {
+      show_mhw_items(ui, opened, index, language, icons)
+    } else {
+      None
+    };
     if let Some(slot) = apply {
       self.apply_mhw_slot(slot);
+    }
+    if let Some(error) = item_error {
+      self.log_line(&fill(tr(language, "✘ Item edit failed: {}"), &[&error]));
     }
   }
 
@@ -262,11 +441,85 @@ impl GuiApp {
       if ui.add_enabled(ready, egui::Button::new(tr(self.language, "Write to save (backs up first)"))).clicked() {
         self.write_mhw_save();
       }
-      ui.label(tr(
-        self.language,
-        "Close the game before writing. The save folder is backed up next to it first.",
-      ));
+      ui.label(tr(self.language, "Close the game first."));
     });
+  }
+}
+
+/// Draws one explorer row. Rows with children fold open and closed, and only the
+/// rows that are open are drawn.
+fn show_node(ui: &mut egui::Ui, node: &codec::Node, depth: usize) {
+  if node.children.is_empty() {
+    ui.horizontal(|ui| {
+      ui.label(egui::RichText::new(node.label.as_str()).strong());
+      ui.label(node.value.as_str());
+    });
+    return;
+  }
+  egui::CollapsingHeader::new(format!("{}  ({})", node.label, node.value))
+    .default_open(depth == 0)
+    .show(ui, |ui| {
+      for child in &node.children {
+        show_node(ui, child, depth + 1);
+      }
+    });
+}
+
+/// Whether an item box entry passes the category and search filters.
+fn box_item_matches(id: u32, category: usize, filter: &str) -> bool {
+  if category != 0 && category_group(id) != category - 1 {
+    return false;
+  }
+  if filter.is_empty() {
+    return true;
+  }
+  let category = crate::items::item_category(id).unwrap_or("");
+  crate::items::item_name_cn(id).unwrap_or("").contains(filter)
+    || crate::items::item_name_en(id).unwrap_or("").to_lowercase().contains(filter)
+    || category.to_lowercase().contains(filter)
+    || crate::items::item_name(id).unwrap_or("").to_lowercase().contains(filter)
+    || format!("{id:08x}").contains(filter)
+    || format!("{id}").contains(filter)
+}
+
+/// The Rise item box as an item model: one area holding every slot.
+struct RiseItemBox<'a> {
+  opened: &'a mut OpenedSave,
+  language: Language,
+}
+
+impl ItemModel for RiseItemBox<'_> {
+  fn game(&self) -> &'static str {
+    "rise"
+  }
+
+  fn areas(&self) -> Vec<Area> {
+    vec![Area { label: tr(self.language, "Item box"), max_amount: itembox::MAX_QUANTITY }]
+  }
+
+  fn entries(&self, _area: usize) -> Vec<Item> {
+    self.opened.box_items.iter().map(|&(id, amount)| Item { id, amount }).collect()
+  }
+
+  fn set_entry(&mut self, _area: usize, index: usize, item: Item) -> Result<(), String> {
+    let mut layout = self.opened.box_items.clone();
+    let slot = layout.get_mut(index).ok_or_else(|| tr(self.language, "No such item box slot").to_owned())?;
+    *slot = if item.amount == 0 { (0, 0) } else { (item.id, item.amount) };
+    edit::write_item_box(self.opened.document.payload_mut(), &layout).map_err(|error| error.to_string())?;
+    self.opened.box_items = edit::read_item_box(self.opened.document.payload())
+      .map_err(|error| error.to_string())?
+      .into_iter()
+      .map(|entry| (entry.id, entry.num))
+      .collect();
+    Ok(())
+  }
+
+  fn name(&self, id: u32) -> String {
+    crate::items::item_display_name_in(id, self.language)
+  }
+
+  fn icon(&self, id: u32) -> Option<Vec<u8>> {
+    crate::rise_icons::item_icon(id)
   }
 }
 
@@ -294,6 +547,8 @@ enum WorkerEvent {
   Saved(Result<(PathBuf, Option<PathBuf>), String>),
   /// A background operation that only produces a status line (backup/restore).
   Report(Result<String, String>),
+  /// The save list for a game, found off the UI thread after a game switch.
+  Discovered(Game, Vec<(PathBuf, String, Option<u32>)>),
 }
 
 // ---------------------------------------------------------------------------
@@ -325,14 +580,13 @@ pub struct GuiApp {
   box_show_empty: bool,
   /// Slot indices (0-based) ticked for bulk actions.
   box_selected: BTreeSet<usize>,
-  /// Row position (in the visible list) of the last checkbox click, for
-  /// shift-click range selection.
-  box_last_clicked: Option<usize>,
   box_bulk_qty: String,
+  /// Decoded item icons, shared by every game's item view.
+  item_icons: itemtiles::IconCache,
+  explorer: Option<ExplorerCache>,
   box_move_slot: String,
   /// Index into [`SortKey::ALL`].
   box_sort: usize,
-  box_edits: Vec<String>,
   game: Game,
   /// Game logo textures, uploaded on the first frame.
   game_logos: Option<[egui::TextureHandle; 3]>,
@@ -380,19 +634,6 @@ const ITEM_CATEGORY_GROUPS: &[(&str, &[&str])] = &[
   ("Tools / Other", &["Tool"]),
 ];
 
-/// Runs `add` inside a fixed-width, fixed-height cell so table columns line
-/// up no matter how wide the content is.
-fn cell<R>(
-  ui: &mut egui::Ui,
-  width: f32,
-  layout: egui::Layout,
-  add: impl FnOnce(&mut egui::Ui) -> R,
-) -> R {
-  let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 18.0), egui::Sense::hover());
-  let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(layout));
-  add(&mut child)
-}
-
 /// Which [`ITEM_CATEGORY_GROUPS`] entry an item id belongs to; ids missing
 /// from the name table fall into the last group.
 fn category_group(id: u32) -> usize {
@@ -408,6 +649,13 @@ impl GuiApp {
   pub fn new(creation_context: &eframe::CreationContext) -> Self {
     let font_status = install_cjk_font(&creation_context.egui_ctx);
     creation_context.egui_ctx.set_visuals(Theme::default().visuals());
+    // Parse the item tables and decode the World icon atlas now, on a worker
+    // thread, so the first item view of a game does not stall the window.
+    thread::spawn(|| {
+      crate::items::warm();
+      crate::rise_icons::warm();
+      crate::mhw::icons::warm();
+    });
     let mut app = Self {
       xfer_cats: vec![true; ITEM_CATEGORY_GROUPS.len()],
       xfer_equip_box: true,
@@ -423,8 +671,108 @@ impl GuiApp {
 
   /// Re-scans Steam for the selected game's saves and drops paths that
   /// belonged to the previously selected game.
+  /// Whether the open save of the current game has changes that are not written.
+  fn has_unsaved(&self) -> bool {
+    self.dirty || self.mhw.as_ref().is_some_and(|opened| opened.dirty)
+  }
+
+  /// Forgets the open save, so a game switch starts clean on that game's first tab.
+  fn close_save(&mut self) {
+    self.target = None;
+    self.source = None;
+    self.mhw = None;
+    self.dirty = false;
+    self.reopen_clicked_once = false;
+    self.explorer = None;
+    self.tab = sections(self.game)[0].0;
+  }
+
+  /// The generic explorer: how this game's save is decoded, written and backed
+  /// up, then the save itself as a tree.
+  fn show_explorer(&mut self, ui: &mut egui::Ui) {
+    let language = self.language;
+    if !self.game.supported() {
+      ui.label(fill(tr(language, "✘ {} saves are not supported yet."), &[&self.game.name()]));
+      return;
+    }
+    let codec = if self.game == Game::World { codec::WORLD_CODEC } else { codec::RISE_CODEC };
+    Grid::new("explorer-codec").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+      ui.strong(tr(language, "Decode"));
+      ui.label(tr(language, codec.decode));
+      ui.end_row();
+      ui.strong(tr(language, "Encode"));
+      ui.label(tr(language, codec.encode));
+      ui.end_row();
+      ui.strong(tr(language, "Backup"));
+      ui.label(tr(language, codec.backup));
+      ui.end_row();
+    });
+
+    let source = if self.game == Game::World {
+      self.mhw.as_ref().map(|opened| opened.path.display().to_string())
+    } else {
+      self.target.as_ref().map(|opened| opened.path.display().to_string())
+    };
+    let Some(source) = source else {
+      ui.label(tr(language, "No save open"));
+      return;
+    };
+
+    ui.separator();
+    let mut refresh = false;
+    ui.horizontal(|ui| {
+      ui.strong(tr(language, "Save contents"));
+      refresh = ui.button(tr(language, "Refresh")).clicked();
+    });
+    let current = self.explorer.as_ref().is_some_and(|cache| cache.game == self.game && cache.source == source);
+    if refresh || !current {
+      let value = if self.game == Game::World {
+        self.mhw.as_ref().map(|opened| opened.save.explorer_value())
+      } else {
+        self.target.as_ref().and_then(|opened| {
+          serde_json::to_value(json::JsonSave::from_payload(
+            opened.document.payload(),
+            Some(opened.document.steamid64()),
+            Some(opened.document.curve_index()),
+          ))
+          .ok()
+        })
+      };
+      self.explorer = value.map(|value| ExplorerCache {
+        game: self.game,
+        source: source.clone(),
+        root: codec::Node::from_value("save", &value),
+      });
+    }
+    if let Some(cache) = &self.explorer {
+      show_node(ui, &cache.root, 0);
+    }
+  }
+
   fn refresh_discovered(&mut self) {
-    self.discovered = discover_steam_slot_files(self.game);
+    let found = discover_steam_slot_files(self.game);
+    self.apply_discovered(found);
+  }
+
+  /// Scans for the selected game's saves on a worker thread, so switching
+  /// games never blocks the window. The game cards show "Loading…" until the
+  /// list arrives.
+  fn start_discovery(&mut self, context: &egui::Context) {
+    let (sender, receiver) = mpsc::channel();
+    self.receiver = Some(receiver);
+    self.busy = true;
+    let game = self.game;
+    self.busy_text = fill(tr(self.language, "Loading {} saves"), &[&game.name()]);
+    let context = context.clone();
+    thread::spawn(move || {
+      let found = discover_steam_slot_files(game);
+      let _ = sender.send(WorkerEvent::Discovered(game, found));
+      context.request_repaint();
+    });
+  }
+
+  fn apply_discovered(&mut self, found: Vec<(PathBuf, String, Option<u32>)>) {
+    self.discovered = found;
     self.target_path.clear();
     self.source_path.clear();
     if let Some((_, _, Some(account))) = self.discovered.first() {
@@ -609,52 +957,6 @@ impl GuiApp {
     Ok(())
   }
 
-  fn pending_item_changes(&self) -> Vec<(u32, u32)> {
-    let Some(opened) = self.target.as_ref() else {
-      return Vec::new();
-    };
-    let mut changes = Vec::new();
-    if opened.box_items.is_empty() || opened.box_items.len() != self.box_edits.len() {
-      return changes;
-    }
-    for (index, (id, num)) in opened.box_items.iter().enumerate() {
-      let text = self.box_edits[index].trim();
-      if text.is_empty() {
-        continue;
-      }
-      if let Ok(op) = QuantityOp::parse(text) {
-        let new_value = op.apply(*num);
-        if new_value != *num {
-          changes.push((*id, new_value));
-        }
-      }
-    }
-    changes
-  }
-
-  fn apply_box_edits(&mut self) -> Result<String, String> {
-    let changes = self.pending_item_changes();
-    if changes.is_empty() {
-      return Err(tr(self.language, "Nothing to apply (quantities unchanged or empty)").to_owned());
-    }
-    let Some(opened) = self.target.as_mut() else {
-      return Err(tr(self.language, "No target save is open").to_owned());
-    };
-    let report = edit::set_item_counts(opened.document.payload_mut(), &changes)
-      .map_err(|error| error.to_string())?;
-    opened.box_items = edit::read_item_box(opened.document.payload())
-      .map_err(|error| error.to_string())?
-      .into_iter()
-      .map(|entry| (entry.id, entry.num))
-      .collect();
-    self.box_edits = vec![String::new(); opened.box_items.len()];
-    self.dirty = true;
-    Ok(fill(
-      tr(self.language, "{} updated, {} new items placed in empty slots"),
-      &[&report.applied, &report.filled],
-    ))
-  }
-
   /// Merge-transfer only the source item slots whose category group is
   /// enabled; other slots keep the target's contents.
   fn transfer_items_filtered(&mut self) -> Result<String, String> {
@@ -730,11 +1032,9 @@ impl GuiApp {
       Some(Ok(entries)) => entries.into_iter().map(|entry| (entry.id, entry.num)).collect(),
       _ => return,
     };
-    let len = items.len();
     if let Some(opened) = self.target.as_mut() {
       opened.box_items = items;
     }
-    self.box_edits = vec![String::new(); len];
     self.dirty = true;
   }
 
@@ -902,6 +1202,13 @@ impl eframe::App for GuiApp {
     self.log_input_events_if_enabled(ui);
     if let Some(receiver) = &self.receiver {
       match receiver.try_recv() {
+        Ok(WorkerEvent::Discovered(game, found)) => {
+          self.busy = false;
+          self.receiver = None;
+          if game == self.game {
+            self.apply_discovered(found);
+          }
+        }
         Ok(WorkerEvent::Opened(result, is_source)) => {
           self.busy = false;
           self.receiver = None;
@@ -932,7 +1239,6 @@ impl eframe::App for GuiApp {
               self.master_rank_input = ranks.map(|r| r.master.to_string()).unwrap_or_default();
               self.mystery_rank_input =
                 ranks.map(|r| r.mystery_research.to_string()).unwrap_or_default();
-              self.box_edits = vec![String::new(); opened.box_items.len()];
               self.refresh_progress_inputs();
               let language = self.language;
               self.log_line(&fill(
@@ -1005,9 +1311,7 @@ impl eframe::App for GuiApp {
     egui::CentralPanel::default().show(ui, |ui| {
       self.show_top_bar(ui);
       ui.add_space(4.0);
-      if self.game != Game::World {
-        self.show_tab_bar(ui);
-      }
+      self.show_tab_bar(ui);
       ui.add_space(4.0);
       // Reserve room for the save bar and log below; without an explicit cap
       // the tab content claims every remaining pixel and pushes the save
@@ -1015,19 +1319,25 @@ impl eframe::App for GuiApp {
       let bottom_reserve = 180.0;
       let content_height = (ui.available_height() - bottom_reserve).max(120.0);
       egui::ScrollArea::vertical().auto_shrink(false).max_height(content_height).show(ui, |ui| {
-        if self.game == Game::World {
-          self.show_mhw_panel(ui);
-          return;
-        }
-        match self.tab {
-          TAB_INFO => self.show_info_tab(ui),
-          TAB_PLAYER => self.show_player_tab(ui),
-          TAB_ITEMBOX => self.show_itembox_tab(ui),
-          TAB_EQUIP => self.show_equip_tab(ui),
-          TAB_TRANSFER => self.show_transfer_tab(ui),
-          TAB_PROGRESS => self.show_progress_tab(ui),
-          TAB_BACKUP => self.show_backup_tab(ui),
-          _ => self.show_help_tab(ui),
+        if self.tab == TAB_EXPLORER {
+          self.show_explorer(ui);
+        } else if self.game == Game::World {
+          if self.tab == TAB_HELP {
+            self.show_help_tab(ui);
+          } else {
+            self.show_mhw_panel(ui);
+          }
+        } else {
+          match self.tab {
+            TAB_INFO => self.show_info_tab(ui),
+            TAB_PLAYER => self.show_player_tab(ui),
+            TAB_ITEMBOX => self.show_itembox_tab(ui),
+            TAB_EQUIP => self.show_equip_tab(ui),
+            TAB_TRANSFER => self.show_transfer_tab(ui),
+            TAB_PROGRESS => self.show_progress_tab(ui),
+            TAB_BACKUP => self.show_backup_tab(ui),
+            _ => self.show_help_tab(ui),
+          }
         }
       });
 
@@ -1115,10 +1425,11 @@ impl GuiApp {
           tint,
         );
         let status_color = if game.supported() { palette.success } else { egui::Color32::from_gray(0xb0) };
+        let status = if selected && self.busy { tr(self.language, "Loading…") } else { tr(self.language, game.status()) };
         painter.text(
           egui::pos2(rect.center().x, rect.max.y - 11.0),
           egui::Align2::CENTER_CENTER,
-          tr(self.language, game.status()),
+          status,
           egui::FontId::proportional(12.0),
           status_color,
         );
@@ -1133,9 +1444,14 @@ impl GuiApp {
           );
         }
         let response = response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(game.name());
-        if response.clicked() && self.game != game {
-          self.game = game;
-          self.refresh_discovered();
+        if response.clicked() && self.game != game && !self.busy {
+          if self.has_unsaved() {
+            self.log_line(tr(self.language, "! Write or discard your changes before switching games"));
+          } else {
+            self.game = game;
+            self.close_save();
+            self.start_discovery(ui.ctx());
+          }
         }
       }
     });
@@ -1171,81 +1487,61 @@ impl GuiApp {
       );
     }
     ui.add_space(4.0);
-    Grid::new("top-bar").num_columns(4).spacing([8.0, 6.0]).show(ui, |ui| {
+    let mut picked: Option<(String, Option<u32>)> = None;
+    Grid::new("top-bar").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
       ui.label(tr(self.language, "Quick select"));
-      let selected = self
-        .discovered
-        .iter()
-        .find(|(path, _, _)| path.display().to_string() == self.target_path)
-        .map(|(_, label, _)| label.clone())
-        .unwrap_or_else(|| tr(self.language, "(no saves found)").to_owned());
-      egui::ComboBox::from_id_salt("discovered-saves").selected_text(selected).show_ui(ui, |ui| {
-        for (path, label, account) in &self.discovered {
-          if ui.selectable_value(&mut self.target_path, path.display().to_string(), label).clicked()
-            && let Some(account) = account
-          {
-            // The save folder name is the 32-bit account id; derive the
-            // SteamID64 automatically so users never have to look it up.
-            self.steamid64 = steamid64_from_account(*account).to_string();
-            let note = format!(
-              "{}\n",
-              fill(tr(self.language, "SteamID64 filled in from the save path: {}"), &[&self.steamid64])
-            );
-            self.log.push_str(&note);
+      ui.horizontal(|ui| {
+        let selected = self
+          .discovered
+          .iter()
+          .find(|(path, _, _)| path.display().to_string() == self.target_path)
+          .map(|(_, label, _)| label.clone())
+          .unwrap_or_else(|| {
+            let text = if self.discovered.is_empty() { "(no saves found)" } else { "Choose a save" };
+            tr(self.language, text).to_owned()
+          });
+        egui::ComboBox::from_id_salt("discovered-saves").selected_text(selected).show_ui(ui, |ui| {
+          for (path, label, account) in &self.discovered {
+            let text = path.display().to_string();
+            if ui.selectable_label(text == self.target_path, label.as_str()).clicked() {
+              picked = Some((text, *account));
+            }
           }
+        });
+        if ui.add_enabled(!self.busy, egui::Button::new(tr(self.language, "Browse…"))).clicked()
+          && let Some(path) = save_dialog(self.game, self.language, "Choose target save").pick_file()
+        {
+          picked = Some((path.display().to_string(), account_id_from_path(&path)));
         }
       });
-      ui.label("SteamID64");
-      ui.add_sized([200.0, 20.0], egui::TextEdit::singleline(&mut self.steamid64));
-      ui.end_row();
-
-      ui.label(tr(self.language, "Target save"));
-      ui.add_sized([420.0, 20.0], egui::TextEdit::singleline(&mut self.target_path));
-      if ui.add_enabled(!self.busy, egui::Button::new(tr(self.language, "Browse…"))).clicked()
-        && let Some(path) = save_dialog(self.game, self.language, "Choose target save").pick_file()
-      {
-        self.target_path = path.display().to_string();
-      }
-      let steamid = self.parsed_steamid64();
-      let open_label = if self.dirty && !self.reopen_clicked_once {
-        tr(self.language, "Open save (unsaved changes)")
-      } else {
-        tr(self.language, "Open save")
-      };
-      if ui
-        .add_enabled(
-          !self.busy
-            && self.game.supported()
-            && (self.game == Game::World || steamid.is_ok())
-            && !self.target_path.trim().is_empty(),
-          egui::Button::new(open_label),
-        )
-        .clicked()
-      {
-        if self.game == Game::World {
-          self.request_mhw_open();
-        } else if self.dirty && !self.reopen_clicked_once {
-          self.reopen_clicked_once = true;
-          self.log_line(tr(self.language, "! Unsaved changes: click Open save again to discard them and reopen"));
-        } else {
-          let task = WorkerTask::Open {
-            path: PathBuf::from(self.target_path.trim()),
-            steamid64: steamid.expect("checked"),
-            is_source: false,
-          };
-          self.reopen_clicked_once = false;
-          self.spawn(ui.ctx(), task);
-        }
-      }
       ui.end_row();
     });
+    if let Some((path, account)) = picked {
+      self.target_path = path;
+      if let Some(account) = account {
+        // The save folder name is the 32-bit account id; derive the SteamID64
+        // automatically so users never have to look it up.
+        self.steamid64 = steamid64_from_account(account).to_string();
+        let note = format!(
+          "{}\n",
+          fill(tr(self.language, "SteamID64 filled in from the save path: {}"), &[&self.steamid64])
+        );
+        self.log.push_str(&note);
+      }
+      self.open_target(ui.ctx());
+    }
     if let Some(error) = &self.status_error {
       let text = fill(tr(self.language, "✘ Last operation failed: {}"), &[&error]);
       ui.colored_label(self.theme.palette().danger, text);
     }
     let language = self.language;
+    let world_open = self.game == Game::World && self.mhw.is_some();
     ui.label(match (&self.target, self.busy) {
       (_, true) => format!("⏳ {}…", self.busy_text),
+      (_, false) if world_open => fill(
+        tr(language, "Opened: {}"),
+        &[&self.mhw.as_ref().map(|opened| opened.path.display().to_string()).unwrap_or_default()],
+      ),
       (Some(opened), _) => fill(
         tr(language, "Opened: {} ({}){}"),
         &[
@@ -1259,17 +1555,8 @@ impl GuiApp {
   }
 
   fn show_tab_bar(&mut self, ui: &mut egui::Ui) {
-    ui.horizontal(|ui| {
-      for (tab, label) in [
-        (TAB_INFO, "General"),
-        (TAB_PLAYER, "Player"),
-        (TAB_ITEMBOX, "Item Box"),
-        (TAB_EQUIP, "Loadouts"),
-        (TAB_TRANSFER, "Transfer"),
-        (TAB_PROGRESS, "Progress"),
-        (TAB_BACKUP, "Backup"),
-        (TAB_HELP, "Help"),
-      ] {
+    ui.horizontal_wrapped(|ui| {
+      for &(tab, label) in sections(self.game) {
         ui.selectable_value(&mut self.tab, tab, tr(self.language, label));
       }
     });
@@ -1278,7 +1565,7 @@ impl GuiApp {
 
   fn show_info_tab(&mut self, ui: &mut egui::Ui) {
     let Some(opened) = self.target.as_ref() else {
-      ui.label(tr(self.language, "No save open. Choose one with Quick select or Browse above, then click Open save."));
+      ui.label(tr(self.language, "No save open. Choose one with Quick select or Browse above."));
       return;
     };
     let language = self.language;
@@ -1389,154 +1676,131 @@ impl GuiApp {
       ui.label(tr(self.language, "No save open."));
       return;
     }
+    let language = self.language;
     ui.horizontal(|ui| {
       ui.add_sized(
         [200.0, 20.0],
-        egui::TextEdit::singleline(&mut self.box_filter).hint_text(tr(self.language, "Search name / ID")),
+        egui::TextEdit::singleline(&mut self.box_filter).hint_text(tr(language, "Search name / ID")),
       );
       let current = if self.box_category == 0 {
-        tr(self.language, "All categories")
+        tr(language, "All categories")
       } else {
-        tr(self.language, ITEM_CATEGORY_GROUPS[self.box_category - 1].0)
+        tr(language, ITEM_CATEGORY_GROUPS[self.box_category - 1].0)
       };
       egui::ComboBox::from_id_salt("box-category").selected_text(current).show_ui(ui, |ui| {
-        ui.selectable_value(&mut self.box_category, 0, tr(self.language, "All categories"));
+        ui.selectable_value(&mut self.box_category, 0, tr(language, "All categories"));
         for (i, (label, _)) in ITEM_CATEGORY_GROUPS.iter().enumerate() {
-          ui.selectable_value(&mut self.box_category, i + 1, tr(self.language, *label));
+          ui.selectable_value(&mut self.box_category, i + 1, tr(language, *label));
         }
       });
-      ui.checkbox(&mut self.box_show_empty, tr(self.language, "Show empty slots"));
-      let changes = self.pending_item_changes();
-      let apply_text = fill(tr(self.language, "Apply item changes ({})"), &[&changes.len()]);
-      if ui.add_enabled(!self.busy && !changes.is_empty(), egui::Button::new(apply_text)).clicked()
-      {
-        match self.apply_box_edits() {
-          Ok(text) => {
-            self.log_line(&fill(tr(self.language, "✔ Item changes applied: {} (in memory)"), &[&text]))
-          }
-          Err(error) => self.log_line(&format!("✘ {error}")),
-        }
-      }
+      ui.checkbox(&mut self.box_show_empty, tr(language, "Show empty slots"));
       if ui
-        .add_enabled(!self.busy && self.target.is_some(), egui::Button::new(tr(self.language, "Write to save (backs up first)")))
+        .add_enabled(!self.busy && self.target.is_some(), egui::Button::new(tr(language, "Write to save (backs up first)")))
         .clicked()
       {
         self.save_target_in_place(ui);
       }
       if self.dirty {
-        ui.label(egui::RichText::new(tr(self.language, "● Unsaved changes")).color(self.theme.palette().accent));
+        ui.label(egui::RichText::new(tr(language, "● Unsaved changes")).color(self.theme.palette().accent));
       }
     });
-    if self.box_edits.len() != self.box_items_len() {
-      ui.label(tr(self.language, "(loading…)"));
-      return;
-    }
     let filter = self.box_filter.trim().to_lowercase();
     let rows = self.visible_box_rows(&filter);
-    let muted = self.theme.palette().ink_muted;
-    let danger = self.theme.palette().danger;
     let selected_count = self.box_selected.len();
     let actionable = !self.busy && selected_count > 0;
-    ui.label(egui::RichText::new(tr(self.language, "Edit selected")).strong());
-    egui::Frame::group(ui.style()).show(ui, |ui| {
+    let danger = self.theme.palette().danger;
+    egui::CollapsingHeader::new(tr(language, "Bulk edit")).default_open(false).show(ui, |ui| {
       ui.horizontal(|ui| {
-        ui.label(fill(tr(self.language, "{} selected"), &[&selected_count]));
-        if ui.button(tr(self.language, "Select all shown")).clicked() {
+        ui.label(fill(tr(language, "{} selected"), &[&selected_count]));
+        if ui.button(tr(language, "Select all shown")).clicked() {
           let with_items: Vec<usize> =
             rows.iter().copied().filter(|&index| self.box_slot_has_item(index)).collect();
           self.box_selected.extend(with_items);
         }
-        if ui.add_enabled(selected_count > 0, egui::Button::new(tr(self.language, "Clear selection"))).clicked() {
+        if ui.add_enabled(selected_count > 0, egui::Button::new(tr(language, "Clear selection"))).clicked() {
           self.box_selected.clear();
-          self.box_last_clicked = None;
         }
         ui.separator();
-        ui.label(tr(self.language, "Quantity"));
+        ui.label(tr(language, "Quantity"));
         ui.add_sized(
           [80.0, 20.0],
-          egui::TextEdit::singleline(&mut self.box_bulk_qty).hint_text(tr(self.language, "5, +5 or -5")),
+          egui::TextEdit::singleline(&mut self.box_bulk_qty).hint_text(tr(language, "5, +5 or -5")),
         );
-        if ui.add_enabled(actionable, egui::Button::new(tr(self.language, "Apply"))).clicked() {
+        if ui.add_enabled(actionable, egui::Button::new(tr(language, "Apply"))).clicked() {
           let result = self.box_set_quantity_selected();
           self.log_box_result(result);
         }
-        let delete_label = egui::RichText::new(tr(self.language, "Delete selected")).color(danger);
+        let delete_label = egui::RichText::new(tr(language, "Delete selected")).color(danger);
         if ui.add_enabled(actionable, egui::Button::new(delete_label)).clicked() {
           let result = self.box_delete_selected();
           self.log_box_result(result);
         }
       });
       ui.horizontal(|ui| {
-        ui.label(tr(self.language, "Move selection to slot"));
+        ui.label(tr(language, "Move selection to slot"));
         ui.add_sized(
           [60.0, 20.0],
           egui::TextEdit::singleline(&mut self.box_move_slot).hint_text("1-1800"),
         );
-        if ui.add_enabled(actionable, egui::Button::new(tr(self.language, "Move"))).clicked() {
+        if ui.add_enabled(actionable, egui::Button::new(tr(language, "Move"))).clicked() {
           let result = self.box_move_selected();
           self.log_box_result(result);
         }
         ui.separator();
-        ui.label(tr(self.language, "Sort box by"));
-        let current = tr(self.language, SortKey::ALL[self.box_sort].label());
+        ui.label(tr(language, "Sort box by"));
+        let current = tr(language, SortKey::ALL[self.box_sort].label());
         egui::ComboBox::from_id_salt("box-sort").selected_text(current).show_ui(ui, |ui| {
           for (i, key) in SortKey::ALL.iter().enumerate() {
-            ui.selectable_value(&mut self.box_sort, i, tr(self.language, key.label()));
+            ui.selectable_value(&mut self.box_sort, i, tr(language, key.label()));
           }
         });
-        if ui.add_enabled(!self.busy, egui::Button::new(tr(self.language, "Sort (empty slots go last)"))).clicked() {
+        if ui.add_enabled(!self.busy, egui::Button::new(tr(language, "Sort (empty slots go last)"))).clicked() {
           let result = self.box_sort_all();
           self.log_box_result(result);
         }
       });
     });
-    ui.horizontal(|ui| {
-      let left = egui::Layout::left_to_right(egui::Align::Center);
-      let right = egui::Layout::right_to_left(egui::Align::Center);
-      let header = |text: &str| egui::RichText::new(text.to_owned()).small().strong().color(muted);
-      let language = self.language;
-      for (width, text) in [(24.0, ""), (52.0, "Slot"), (240.0, "Name"), (90.0, "Category"), (84.0, "ID")] {
-        cell(ui, width, left, |ui| ui.label(header(tr(language, text))));
-      }
-      cell(ui, 72.0, right, |ui| ui.label(header(tr(language, "Qty"))));
-      cell(ui, 90.0, left, |ui| ui.label(header(tr(language, "New qty"))));
-    });
-    egui::ScrollArea::vertical().max_height(300.0).auto_shrink(false).show_rows(
-      ui,
-      22.0,
-      rows.len(),
-      |ui, range| {
-        for row in range {
-          let index = rows[row];
-          let Some(checked) = self.show_item_row(ui, index) else {
-            continue;
-          };
-          let shift = ui.input(|input| input.modifiers.shift);
-          let affected: Vec<usize> = match (shift, self.box_last_clicked) {
-            (true, Some(last)) => {
-              let (from, to) = (last.min(row), last.max(row));
-              rows[from..=to].iter().copied().filter(|&i| self.box_slot_has_item(i)).collect()
-            }
-            _ => vec![index],
-          };
-          for slot in affected {
-            if checked {
-              self.box_selected.insert(slot);
-            } else {
-              self.box_selected.remove(&slot);
-            }
+
+    // The item box as tiles, the same view every game uses. A tile's amount
+    // edits the slot; clicking a filled tile ticks it for the bulk actions.
+    let include_category = self.box_category;
+    let include_filter = filter.clone();
+    let include = move |item: itemtiles::Item| box_item_matches(item.id, include_category, &include_filter);
+    let selected: BTreeSet<(usize, usize)> = self.box_selected.iter().map(|&index| (0, index)).collect();
+    let view = itemtiles::View {
+      language,
+      show_empty: self.box_show_empty,
+      include: &include,
+      selected: Some(&selected),
+      area: Some(0),
+    };
+    let Some(opened) = self.target.as_deref_mut() else {
+      return;
+    };
+    let mut model = RiseItemBox { opened, language };
+    let actions = itemtiles::show(ui, &model, &mut self.item_icons, &view);
+    let mut failure = None;
+    let mut changed = false;
+    for action in actions {
+      match action {
+        itemtiles::Action::Set { area, index, item } => match model.set_entry(area, index, item) {
+          Ok(()) => changed = true,
+          Err(error) => failure = Some(error),
+        },
+        itemtiles::Action::Pick { index, .. } => {
+          if !self.box_selected.remove(&index) {
+            self.box_selected.insert(index);
           }
-          self.box_last_clicked = Some(row);
         }
-      },
-    );
-    ui.label(fill(
-      tr(
-        self.language,
-        "Showing {} of {} slots. Tick rows (shift-click for a range) to edit many at once. Per row, New qty accepts 5 (set), +5 (add) or -5 (subtract); blank = no change, 0 = clear the item.",
-      ),
-      &[&rows.len(), &self.box_items_len()],
-    ));
+      }
+    }
+    if changed {
+      self.dirty = true;
+    }
+    if let Some(error) = failure {
+      self.log_line(&format!("✘ {error}"));
+    }
+    ui.label(fill(tr(language, "{} of {} shown"), &[&rows.len(), &self.box_items_len()]));
   }
 
   fn box_slot_has_item(&self, index: usize) -> bool {
@@ -1568,8 +1832,6 @@ impl GuiApp {
       .into_iter()
       .map(|entry| (entry.id, entry.num))
       .collect();
-    self.box_edits = vec![String::new(); opened.box_items.len()];
-    self.box_last_clicked = None;
     self.dirty = true;
     Ok(message)
   }
@@ -1629,60 +1891,6 @@ impl GuiApp {
     })?;
     self.box_selected.clear();
     Ok(message)
-  }
-
-  /// Draws one item box row. Returns `Some(checked)` when the row's checkbox
-  /// was clicked this frame.
-  fn show_item_row(&mut self, ui: &mut egui::Ui, index: usize) -> Option<bool> {
-    let (id, num) = self.target.as_ref().map(|opened| opened.box_items[index])?;
-    let muted = self.theme.palette().ink_muted;
-    let mut selected = self.box_selected.contains(&index);
-    let mut toggled = None;
-    let fill = if selected { ui.visuals().selection.bg_fill } else { egui::Color32::TRANSPARENT };
-    egui::Frame::new().fill(fill).corner_radius(egui::CornerRadius::same(3)).show(ui, |ui| {
-      ui.horizontal(|ui| {
-        let left = egui::Layout::left_to_right(egui::Align::Center);
-        let right = egui::Layout::right_to_left(egui::Align::Center);
-        if num > 0 {
-          if cell(ui, 24.0, left, |ui| ui.checkbox(&mut selected, "")).changed() {
-            toggled = Some(selected);
-          }
-        } else {
-          cell(ui, 24.0, left, |_| {});
-        }
-        cell(ui, 52.0, left, |ui| {
-          ui.label(egui::RichText::new(format!("{:04}", index + 1)).monospace().color(muted))
-        });
-        if num == 0 {
-          cell(ui, 240.0, left, |ui| {
-            ui.label(egui::RichText::new(tr(self.language, "(empty slot)")).italics().color(muted))
-          });
-        } else {
-          let name = crate::items::item_display_name_in(id, self.language);
-          let response = cell(ui, 240.0, left, |ui| {
-            ui.add(egui::Label::new(egui::RichText::new(name).strong()).truncate())
-          });
-          // Hover shows the other language's name, if the table has one.
-          let other = match self.language {
-            Language::English => crate::items::item_name_cn(id),
-            Language::Chinese => crate::items::item_name_en(id),
-          };
-          if let Some(other) = other {
-            response.on_hover_text(other);
-          }
-        }
-        let category = crate::items::item_category(id).unwrap_or("-");
-        cell(ui, 90.0, left, |ui| {
-          ui.add(egui::Label::new(egui::RichText::new(category).color(muted)).truncate())
-        });
-        cell(ui, 84.0, left, |ui| {
-          ui.label(egui::RichText::new(format!("{id:08x}")).monospace().color(muted))
-        });
-        cell(ui, 72.0, right, |ui| ui.label(egui::RichText::new(num.to_string()).monospace()));
-        ui.add_sized([90.0, 18.0], egui::TextEdit::singleline(&mut self.box_edits[index]));
-      });
-    });
-    toggled
   }
 
   fn show_equip_tab(&mut self, ui: &mut egui::Ui) {
@@ -1865,7 +2073,7 @@ impl GuiApp {
 
   fn show_transfer_tab(&mut self, ui: &mut egui::Ui) {
     if self.target.is_none() {
-      ui.label(tr(self.language, "Open the target save first (Quick select or Browse above, then Open save) before transferring."));
+      ui.label(tr(self.language, "Open the target save first (Quick select or Browse above) before transferring."));
       return;
     }
     ui.label(tr(self.language, "Merge data from the source save into the target save (same Steam account):"));
@@ -2274,19 +2482,7 @@ impl GuiApp {
         if !self.box_show_empty && num == 0 {
           return false;
         }
-        if self.box_category != 0 && category_group(id) != self.box_category - 1 {
-          return false;
-        }
-        if filter.is_empty() {
-          return true;
-        }
-        let category = crate::items::item_category(id).unwrap_or("");
-        crate::items::item_name_cn(id).unwrap_or("").contains(filter)
-          || crate::items::item_name_en(id).unwrap_or("").to_lowercase().contains(filter)
-          || category.to_lowercase().contains(filter)
-          || crate::items::item_name(id).unwrap_or("").to_lowercase().contains(filter)
-          || format!("{id:08x}").contains(filter)
-          || format!("{id}").contains(filter)
+        box_item_matches(id, self.box_category, filter)
       })
       .collect()
   }
@@ -2332,10 +2528,16 @@ fn save_dialog(game: Game, language: Language, title: &'static str) -> rfd::File
 /// (`userdata/<account>/<app id>/...`, see `Game::save_subdir`).
 fn discover_save_dirs(game: Game) -> Vec<PathBuf> {
   let mut roots: Vec<PathBuf> = Vec::new();
-  if let Ok(output) = std::process::Command::new("reg")
-    .args(["query", r"HKCU\Software\Valve\Steam", "/v", "SteamPath"])
-    .output()
+  let mut query = std::process::Command::new("reg");
+  query.args(["query", r"HKCU\Software\Valve\Steam", "/v", "SteamPath"]);
+  // The app is a windowed program, so a console child would flash a console
+  // window on every game switch. CREATE_NO_WINDOW keeps it hidden.
+  #[cfg(windows)]
   {
+    use std::os::windows::process::CommandExt;
+    query.creation_flags(0x0800_0000);
+  }
+  if let Ok(output) = query.output() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
       if let Some(position) = line.find("REG_SZ") {

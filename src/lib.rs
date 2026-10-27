@@ -7,6 +7,7 @@
 //! on top of them.
 
 pub mod archive;
+pub mod codec;
 pub mod container;
 pub mod crypto;
 pub mod diff;
@@ -18,8 +19,10 @@ pub mod gui;
 pub mod i18n;
 pub mod itembox;
 pub mod items;
+pub mod itemtiles;
 pub mod json;
 pub mod language;
 pub mod mhw;
 pub mod payload;
+pub mod rise_icons;
 pub mod theme;

@@ -844,10 +844,34 @@ pub fn read_points(payload: &SavePayload) -> Option<u32> {
   read_scalar(payload, VILLAGE_POINT_CLASS, VILLAGE_POINT_VALUE)
 }
 
-/// Reads the hunter's display name (`snow.data.ProfileData.HunterName`).
-/// Buddy lists reuse the same field for buddy names, so the first match in
-/// document order — the hunter's own profile — is returned.
+/// The name on the hunter's own guild card. The self card is the only
+/// `GuildCardData` outside an array; buddy cards live in arrays and reuse the
+/// same name field.
+fn self_card_name(payload: &SavePayload) -> Option<String> {
+  fn card_name(card: &Class) -> Option<String> {
+    card.fields.iter().find_map(|field| match &field.value {
+      FieldValue::String(units) if field.hash == HUNTER_NAME_FIELD => Some(String::from_utf16_lossy(units)),
+      _ => None,
+    })
+  }
+  fn find_self(class: &Class) -> Option<String> {
+    if class.hash == GUILD_CARD_CLASS {
+      return card_name(class);
+    }
+    class.fields.iter().find_map(|field| match &field.value {
+      FieldValue::Class(nested) => find_self(nested),
+      _ => None,
+    })
+  }
+  payload.entries.iter().find_map(|entry| find_self(&entry.class))
+}
+
+/// Reads the hunter's display name. The own guild card is preferred; the
+/// fallback takes the first name field in document order, which may be a buddy.
 pub fn read_hunter_name(payload: &SavePayload) -> Option<String> {
+  if let Some(name) = self_card_name(payload) {
+    return Some(name);
+  }
   fn walk(class: &Class, out: &mut Option<String>) {
     if out.is_some() {
       return;
@@ -1843,6 +1867,46 @@ mod tests {
     };
     assert_eq!(read_hunter_name(&payload).as_deref(), Some("原初形态爵银龙"));
     assert_eq!(read_hunter_name(&SavePayload { entries: vec![] }), None);
+  }
+
+  #[test]
+  fn prefers_the_self_card_over_buddy_cards_in_arrays() {
+    // A buddy card sits in an array before the hunter's own card, which is a
+    // plain nested class; the own card must win.
+    let buddy = Class {
+      hash: 0x4454_1321,
+      fields: vec![Field {
+        hash: HUNTER_NAME_FIELD,
+        field_type: 0x0f,
+        value: FieldValue::String("Buddy".encode_utf16().collect()),
+      }],
+    };
+    let own = Class {
+      hash: 0x4454_1321,
+      fields: vec![Field {
+        hash: HUNTER_NAME_FIELD,
+        field_type: 0x0f,
+        value: FieldValue::String("Jubs".encode_utf16().collect()),
+      }],
+    };
+    let buddy_list = Array {
+      member_type: 0,
+      member_size: 0,
+      array_type: 0,
+      class_hashes: None,
+      values: vec![ArrayValue::Class(Box::new(buddy))],
+    };
+    let holder = Class {
+      hash: 0x2,
+      fields: vec![
+        Field { hash: 0x3, field_type: 0x11, value: FieldValue::Array(buddy_list) },
+        Field { hash: 0x4, field_type: 0x11, value: FieldValue::Class(Box::new(own)) },
+      ],
+    };
+    let payload = SavePayload {
+      entries: vec![NativeClass { native_hash: 0x10, class: holder }],
+    };
+    assert_eq!(read_hunter_name(&payload).as_deref(), Some("Jubs"));
   }
 
   #[test]

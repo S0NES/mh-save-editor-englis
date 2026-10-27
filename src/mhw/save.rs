@@ -44,6 +44,66 @@ const PLAYTIME: usize = MASTER_RANK_XP + 4;
 /// Highest zenny and research points the game shows.
 pub const MAX_ZENI: u32 = 999_999_999;
 
+/// Offsets inside a slot of `mhw_save_slot`: the item pouch, then storage.
+const ITEM_POUCH: usize = 0x11_6098;
+const ITEM_STORAGE: usize = 0x11_6300;
+/// One `mhw_item_slot`: a u32 item id followed by a u32 amount.
+const ITEM_SLOT_LEN: usize = 8;
+/// Largest amount the editor writes for one item entry.
+pub const MAX_ITEM_AMOUNT: u32 = 9_999;
+
+/// One entry of the item pouch or storage. An id of 0 means the entry is empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ItemSlot {
+  pub id: u32,
+  pub amount: u32,
+}
+
+/// The item lists a character slot keeps, in the order the game stores them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemArea {
+  PouchItems,
+  PouchAmmo,
+  StorageItems,
+  StorageAmmo,
+  StorageMaterials,
+  StorageDecorations,
+}
+
+impl ItemArea {
+  pub const ALL: [ItemArea; 6] = [
+    ItemArea::PouchItems,
+    ItemArea::PouchAmmo,
+    ItemArea::StorageItems,
+    ItemArea::StorageAmmo,
+    ItemArea::StorageMaterials,
+    ItemArea::StorageDecorations,
+  ];
+
+  /// How many entries the game keeps in this area.
+  pub fn capacity(self) -> usize {
+    match self {
+      ItemArea::PouchItems => 24,
+      ItemArea::PouchAmmo => 16,
+      ItemArea::StorageItems | ItemArea::StorageAmmo => 200,
+      ItemArea::StorageMaterials => 1250,
+      ItemArea::StorageDecorations => 500,
+    }
+  }
+
+  /// Offset of the area's first entry inside the slot.
+  fn offset(self) -> usize {
+    match self {
+      ItemArea::PouchItems => ITEM_POUCH,
+      ItemArea::PouchAmmo => ITEM_POUCH + 24 * ITEM_SLOT_LEN,
+      ItemArea::StorageItems => ITEM_STORAGE,
+      ItemArea::StorageAmmo => ITEM_STORAGE + 200 * ITEM_SLOT_LEN,
+      ItemArea::StorageMaterials => ITEM_STORAGE + 400 * ITEM_SLOT_LEN,
+      ItemArea::StorageDecorations => ITEM_STORAGE + 1650 * ITEM_SLOT_LEN,
+    }
+  }
+}
+
 /// Editable fields of one character slot, as read from the save.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hunter {
@@ -141,6 +201,67 @@ impl MhwSave {
     Ok(())
   }
 
+  /// Every entry of one item area of a character slot, empty ones included.
+  pub fn items(&self, slot: usize, area: ItemArea) -> Result<Vec<ItemSlot>> {
+    let base = self.item_base(slot, area)?;
+    Ok((0..area.capacity())
+      .map(|index| {
+        let at = base + index * ITEM_SLOT_LEN;
+        ItemSlot { id: self.read_u32(at), amount: self.read_u32(at + 4) }
+      })
+      .collect())
+  }
+
+  /// The whole save as a JSON tree for the generic explorer: each slot's hunter
+  /// fields and the non-empty entries of every item area.
+  pub fn explorer_value(&self) -> serde_json::Value {
+    let slots: Vec<serde_json::Value> = (0..SLOT_COUNT)
+      .filter_map(|slot| {
+        let hunter = self.hunter(slot).ok()?;
+        let mut areas = serde_json::Map::new();
+        for area in ItemArea::ALL {
+          let entries: Vec<serde_json::Value> = self
+            .items(slot, area)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|item| item.id != 0)
+            .map(|item| serde_json::json!({ "id": item.id, "amount": item.amount }))
+            .collect();
+          areas.insert(format!("{area:?}"), serde_json::Value::Array(entries));
+        }
+        Some(serde_json::json!({
+          "slot": slot + 1,
+          "hunter": {
+            "name": hunter.name,
+            "hunter_rank": hunter.hunter_rank,
+            "hunter_rank_xp": hunter.hunter_rank_xp,
+            "master_rank": hunter.master_rank,
+            "master_rank_xp": hunter.master_rank_xp,
+            "zeni": hunter.zeni,
+            "research_points": hunter.research_points,
+            "playtime_seconds": hunter.playtime,
+          },
+          "items": areas,
+        }))
+      })
+      .collect();
+    serde_json::json!({ "steam_id": self.steam_id().to_string(), "slots": slots })
+  }
+
+  /// Sets one entry of an item area. An id of 0 with amount 0 clears it.
+  pub fn set_item(&mut self, slot: usize, area: ItemArea, index: usize, item: ItemSlot) -> Result<()> {
+    ensure!(index < area.capacity(), "{area:?} has {} entries", area.capacity());
+    ensure!(item.amount <= MAX_ITEM_AMOUNT, "item amounts are capped at {MAX_ITEM_AMOUNT}");
+    let at = self.item_base(slot, area)? + index * ITEM_SLOT_LEN;
+    self.data[at..at + 4].copy_from_slice(&item.id.to_le_bytes());
+    self.data[at + 4..at + 8].copy_from_slice(&item.amount.to_le_bytes());
+    Ok(())
+  }
+
+  fn item_base(&self, slot: usize, area: ItemArea) -> Result<usize> {
+    Ok(self.slot_base(slot)? + area.offset())
+  }
+
   /// Re-encrypts the save into the bytes the game reads.
   pub fn to_bytes(&self) -> Result<Vec<u8>> {
     let mut data = self.data.clone();
@@ -214,6 +335,39 @@ mod tests {
     assert_eq!(after.hunter_rank, before.hunter_rank);
     assert_eq!(after.hunter_rank_xp, before.hunter_rank_xp);
     assert_eq!(reopened.hunter(1).unwrap(), save.hunter(1).unwrap());
+  }
+
+  #[test]
+  fn item_areas_match_the_struct_layout() {
+    // mhw_item_pouch is 616 bytes, and storage is 17200 bytes after it ends.
+    assert_eq!(ITEM_POUCH + 616, ITEM_STORAGE);
+    let storage_end = ItemArea::StorageDecorations.offset() + 500 * ITEM_SLOT_LEN;
+    assert_eq!(storage_end - ITEM_STORAGE, 17_200);
+    assert_eq!(ItemArea::PouchAmmo.offset() + 16 * ITEM_SLOT_LEN, ITEM_POUCH + 192 + 128);
+  }
+
+  /// Reads the item pouch of a real save and checks every non-empty entry has a
+  /// World name. Runs only when `MHW_SAVE_FIXTURE` is set.
+  #[test]
+  fn real_save_item_pouch_has_names() {
+    let Some(path) = std::env::var_os("MHW_SAVE_FIXTURE") else {
+      return;
+    };
+    let save = MhwSave::open_bytes(&fs::read(path).unwrap()).unwrap();
+    for entry in save.items(0, ItemArea::PouchItems).unwrap().into_iter().filter(|entry| entry.id != 0) {
+      println!("pouch: {} x{} = {:?}", entry.id, entry.amount, crate::mhw::items::item_name(entry.id));
+      assert!(crate::mhw::items::item_name(entry.id).is_some(), "no name for item {}", entry.id);
+    }
+  }
+
+  #[test]
+  fn item_entries_round_trip_and_reject_bad_values() {
+    let mut save = MhwSave { data: vec![0; IB_SAVE_LEN] };
+    let potion = ItemSlot { id: 1, amount: 99 };
+    save.set_item(1, ItemArea::StorageDecorations, 499, potion).unwrap();
+    assert_eq!(save.items(1, ItemArea::StorageDecorations).unwrap()[499], potion);
+    assert!(save.set_item(0, ItemArea::PouchItems, 24, potion).is_err());
+    assert!(save.set_item(0, ItemArea::PouchItems, 0, ItemSlot { id: 1, amount: MAX_ITEM_AMOUNT + 1 }).is_err());
   }
 
   #[test]
