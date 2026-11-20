@@ -200,12 +200,18 @@ fn is_steam_save_dir(source: &Path) -> bool {
     && source.parent().and_then(|parent| parent.file_name()).is_some_and(|name| name == "remote")
 }
 
+/// Home directory of the current user: `USERPROFILE` on Windows, `HOME` on
+/// Unix-like systems. Returns `None` when neither variable is set.
+pub fn home_dir() -> Option<PathBuf> {
+  std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from)
+}
+
 fn documents_backup_destination(source: &Path, suffix: &str) -> Option<PathBuf> {
   // userdata/<account>/<appid>/remote/win64_save: the account folder sits
   // three levels above the save directory.
   let account = source.parent()?.parent()?.parent()?.file_name()?.to_str()?.to_owned();
-  let home = std::env::var_os("USERPROFILE")?;
-  Some(PathBuf::from(home).join("Documents").join("MHR-Save-Backups").join(account).join(suffix))
+  let home = home_dir()?;
+  Some(home.join("Documents").join("MHR-Save-Backups").join(account).join(suffix))
 }
 
 fn timestamp_suffix() -> String {
