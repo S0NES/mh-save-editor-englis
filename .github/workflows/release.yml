@@ -39,10 +39,10 @@ jobs:
           EOF2
 
       - name: Build release binary
-        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+        run: cargo build --release --locked
 
       - name: Package release zip
-        run: python scripts/package.py --skip-build --target x86_64-pc-windows-msvc
+        run: python scripts/package.py --skip-build
 
       - name: Upload release artifact
         uses: actions/upload-artifact@v4
