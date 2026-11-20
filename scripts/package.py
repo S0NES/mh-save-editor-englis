@@ -14,10 +14,18 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def host_triple() -> str:
+    out = subprocess.run(["rustc", "-vV"], capture_output=True, text=True, check=True).stdout
+    for line in out.splitlines():
+        if line.startswith("host:"):
+            return line.split("host:", 1)[1].strip()
+    raise SystemExit("could not detect the host rust triple")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--skip-build", action="store_true", help="reuse an existing release build")
-    parser.add_argument("--target", default=None, help="release target triple; defaults to a host build")
+    parser.add_argument("--target", default=None, help="release target triple; defaults to the host build")
     args = parser.parse_args()
 
     if not args.skip_build:
@@ -28,19 +36,24 @@ def main() -> None:
         r'^version\s*=\s*"([^"]+)"', (ROOT / "Cargo.toml").read_text(encoding="utf-8"), re.M
     ).group(1)
 
-    target = args.target or ""
-    release_dir = ROOT / "target" / (target or "release")
+    if args.target:
+        triple = args.target
+        release_dir = ROOT / "target" / args.target / "release"
+    else:
+        triple = host_triple()
+        release_dir = ROOT / "target" / "release"
+
     if not release_dir.is_dir():
         raise SystemExit(f"missing build output directory {release_dir}")
 
-    if "windows" in target or not target:
+    if "windows" in triple:
         binaries = ["mhrise-save-editor.exe", "mhrise-save-editor-gui.exe"]
         suffix = "win64"
-    elif "linux" in target:
+    elif "linux" in triple:
         binaries = ["mhrise-save-editor", "mhrise-save-editor-gui"]
         suffix = "linux-x64"
     else:
-        raise SystemExit(f"unsupported release target: {target}")
+        raise SystemExit(f"unsupported release target: {triple}")
 
     for name in binaries:
         if not (release_dir / name).is_file():
