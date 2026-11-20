@@ -2301,8 +2301,8 @@ impl GuiApp {
 /// `Documents\MHR-Save-Backups\<account>\<timestamp>`.
 fn backups_for_target(target_save: &Path) -> Option<Vec<PathBuf>> {
   let account = target_save.parent()?.parent()?.parent()?.file_name()?.to_str()?;
-  let home = std::env::var_os("USERPROFILE")?;
-  let root = PathBuf::from(home).join("Documents").join("MHR-Save-Backups").join(account);
+  let home = crate::archive::home_dir()?;
+  let root = home.join("Documents").join("MHR-Save-Backups").join(account);
   let mut backups: Vec<PathBuf> = fs::read_dir(&root)
     .ok()?
     .filter_map(|entry| entry.ok())
@@ -2348,9 +2348,15 @@ fn discover_save_dirs(game: Game) -> Vec<PathBuf> {
   }
   // Heuristic fallbacks for common install locations; the registry and the
   // library manifest above are the authoritative sources.
-  roots.push(PathBuf::from(r"C:\Program Files (x86)\Steam"));
-  roots.push(PathBuf::from(r"D:\Steam"));
-  roots.push(PathBuf::from(r"E:\Steam"));
+  if cfg!(windows) {
+    roots.push(PathBuf::from(r"C:\Program Files (x86)\Steam"));
+    roots.push(PathBuf::from(r"D:\Steam"));
+    roots.push(PathBuf::from(r"E:\Steam"));
+  } else if let Some(home) = crate::archive::home_dir() {
+    // Linux and macOS keep the library under the user's home directory.
+    roots.push(home.join(".steam").join("steam"));
+    roots.push(home.join(".local").join("share").join("Steam"));
+  }
 
   let mut libraries = roots.clone();
   for root in &roots {

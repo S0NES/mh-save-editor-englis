@@ -13,6 +13,8 @@ proxy = ""
 git-fetch-with-cli = true
 
 # Statically link the VC++ runtime so the release exes run on machines
-# without the Visual C++ Redistributable installed.
-[build]
+# without the Visual C++ Redistributable installed. Scoped to Windows targets:
+# passing it globally also reaches proc-macro crates, which breaks the build
+# on non-Windows hosts.
+[target.'cfg(windows)']
 rustflags = ["-C", "target-feature=+crt-static"]
