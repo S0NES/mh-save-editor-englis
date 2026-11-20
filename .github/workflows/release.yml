@@ -1,0 +1,122 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-windows:
+    name: Build Windows release
+    runs-on: windows-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Configure cargo for CI
+        shell: bash
+        run: |
+          cat > .cargo/config.toml <<'EOF2'
+          [net]
+          git-fetch-with-cli = true
+
+          [target.'cfg(windows)']
+          rustflags = ["-C", "target-feature=+crt-static"]
+          EOF2
+
+      - name: Build release binary
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Package release zip
+        run: python scripts/package.py --skip-build --target x86_64-pc-windows-msvc
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: win64
+          path: dist/*.zip
+          if-no-files-found: error
+
+  build-linux:
+    name: Build Linux release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Configure cargo for CI
+        shell: bash
+        run: |
+          cat > .cargo/config.toml <<'EOF2'
+          [net]
+          git-fetch-with-cli = true
+
+          [target.'cfg(windows)']
+          rustflags = ["-C", "target-feature=+crt-static"]
+          EOF2
+
+      - name: Build release binary
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu
+
+      - name: Package release zip
+        run: python3 scripts/package.py --skip-build --target x86_64-unknown-linux-gnu
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64
+          path: dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: win64
+          path: dist-win64
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-x64
+          path: dist-linux-x64
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          gh release create "$TAG" \
+            --title "v${VERSION}" \
+            --generate-notes \
+            "dist-win64/mhrise-save-editor-v${VERSION}-win64.zip" \
+            "dist-linux-x64/mhrise-save-editor-v${VERSION}-linux-x64.zip"
